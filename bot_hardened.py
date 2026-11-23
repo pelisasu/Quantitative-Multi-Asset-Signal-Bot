@@ -308,14 +308,16 @@ def fetch_pair_locked(instrument: str, mode: str, history: bool = False
     for src in cfg["source_groups"]:
         df_htf = df_ent = None
         if src["type"] == "yfinance":
-            df_htf = fetch_yf(src["symbol"], tf["htf"],   tf["period_htf"],   tf["min_bars_htf"])
-            df_ent = fetch_yf(src["symbol"], tf["entry"], tf["period_entry"], tf["min_bars_entry"])
+            p_htf = "90d" if (history and tf["htf"] == "1h") else tf["period_htf"]
+            p_ent = "59d" if (history and tf["entry"] == "15m") else tf["period_entry"]
+            df_htf = fetch_yf(src["symbol"], tf["htf"],   p_htf, tf["min_bars_htf"])
+            df_ent = fetch_yf(src["symbol"], tf["entry"], p_ent, tf["min_bars_entry"])
         elif src["type"] == "coinbase":
             g_htf = COINBASE_GRAN.get(tf["htf"])
             g_ent = COINBASE_GRAN.get(tf["entry"])
             if g_htf and g_ent:
-                b_htf = 5 if history else 2
-                b_ent = 8 if history else 2
+                b_htf = 6 if history else 2
+                b_ent = 16 if history else 2
                 df_htf = fetch_coinbase(src["symbol"], g_htf, tf["min_bars_htf"], max_batches=b_htf)
                 df_ent = fetch_coinbase(src["symbol"], g_ent, tf["min_bars_entry"], max_batches=b_ent)
 
@@ -607,6 +609,8 @@ def evaluate_signal(instrument: str, mode: str,
     cal = (calibrated or {}).get(f"{instrument}:{mode}", {})
     threshold = int(cal.get("threshold", GLOBAL["min_score_signal"]))
     sl_mult   = float(cal.get("sl_mult", tf["sl_atr"]))
+    tp2_mult  = float(cal.get("tp_mult", tf["tp_atr"][1]))
+    tp3_mult  = max(float(tf["tp_atr"][2]), round(tp2_mult * 1.5, 2))
 
     res, diag = evaluate_bar_pair(df_htf, htf_sh, htf_sl, len(df_htf) - 1,
                                   df_ent, len(df_ent) - 1, threshold)
@@ -621,13 +625,13 @@ def evaluate_signal(instrument: str, mode: str,
     if direction == "BUY":
         sl  = entry - sl_mult * atr
         tp1 = entry + tf["tp_atr"][0] * atr
-        tp2 = entry + tf["tp_atr"][1] * atr
-        tp3 = entry + tf["tp_atr"][2] * atr
+        tp2 = entry + tp2_mult * atr
+        tp3 = entry + tp3_mult * atr
     else:
         sl  = entry + sl_mult * atr
         tp1 = entry - tf["tp_atr"][0] * atr
-        tp2 = entry - tf["tp_atr"][1] * atr
-        tp3 = entry - tf["tp_atr"][2] * atr
+        tp2 = entry - tp2_mult * atr
+        tp3 = entry - tp3_mult * atr
 
     risk_pct = ACCOUNT["risk_pct_scalp"] if mode == "SCALPING" else ACCOUNT["risk_pct_swing"]
     lot, risk_warn = calc_lot(float(ACCOUNT["balance"]), risk_pct, abs(entry - sl),
@@ -656,7 +660,9 @@ def _to_epoch_sec(idx: pd.DatetimeIndex) -> np.ndarray:
 def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mode: str,
                  sl_mult: float, tp_target_mult: float, threshold: int,
                  min_trades: Optional[int] = None,
-                 precomputed: Optional[Tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray]] = None
+                 precomputed: Optional[Tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray]] = None,
+                 start_idx: int = 60,
+                 end_idx: Optional[int] = None
                  ) -> Dict[str, Any]:
     tf = TIMEFRAMES[mode]
     spread = float(GLOBAL["spread_pts"].get(instrument, 1.0))
@@ -679,8 +685,8 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
     htf_ptr = 0
     last_exit_ts = 0.0
     last_dir: Optional[str] = None
-    i = 60
-    n_ent = len(df_ent)
+    i = max(60, int(start_idx))
+    n_ent = min(len(df_ent), int(end_idx)) if end_idx is not None else len(df_ent)
 
     while i < n_ent - 2:
         if equity < GLOBAL["bt_min_equity"] or (peak - equity) / max(peak, 1e-9) > GLOBAL["bt_max_dd_stop"]:
@@ -750,11 +756,12 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
                 c = float(df_ent["Close"].iloc[j])
                 exit_px = (c - spread / 2.0 - slip) if direction == "BUY" else (c + spread / 2.0 + slip)
 
+        risk_amt = max(equity * risk_frac, 1e-9)
         pnl = realized_partial + ((exit_px - fill) if direction == "BUY" else (fill - exit_px)) * (units * rem_frac)
         equity += pnl
         peak = max(peak, equity)
         curve.append(equity)
-        trades.append({"pnl": pnl, "exit": exit_reason, "r": pnl / max(equity * risk_frac, 1e-9)})
+        trades.append({"pnl": pnl, "exit": exit_reason, "r": pnl / risk_amt})
         last_exit_ts = ent_open_ts[exit_j]
         last_dir = direction
         i = exit_j + 1  # Non-overlapping!
@@ -1065,23 +1072,9 @@ def run_calibration(mode: str = "SWING") -> None:
             continue
         logging.info(f"[cal-scan] {inst} {mode} src={src} htf={len(df_htf)} ent={len(df_ent)}")
 
+        # Indicators and causal swings are strictly backward-looking, so computing once
+        # avoids OOS EMA200 truncation while enforcing zero bar overlap via [60..split_e] vs [split_e..n].
         split_e = int(len(df_ent) * (1.0 - GLOBAL["bt_oos_fraction"]))
-        split_ts = df_ent.index[split_e]
-        df_htf_is  = df_htf[df_htf.index <= split_ts]
-        df_htf_oos = df_htf[df_htf.index >  split_ts - pd.Timedelta(hours=80)]
-        df_ent_is  = df_ent.iloc[:split_e]
-        df_ent_oos = df_ent.iloc[max(0, split_e - 80):]
-
-        pre_is = (
-            compute_indicators(df_htf_is),
-            compute_indicators(df_ent_is),
-            *extract_causal_swings(df_htf_is, lookback=5),
-        )
-        pre_oos = (
-            compute_indicators(df_htf_oos),
-            compute_indicators(df_ent_oos),
-            *extract_causal_swings(df_htf_oos, lookback=5),
-        )
         pre_full = (
             compute_indicators(df_htf),
             compute_indicators(df_ent),
@@ -1093,14 +1086,19 @@ def run_calibration(mode: str = "SWING") -> None:
         for slm in (1.5, 2.0, 2.5):
             for tpm in (2.0, 3.0):
                 for th in (65, 68, 74):
-                    is_r = backtest_mtf(df_htf_is, df_ent_is, inst, mode, slm, tpm, th,
-                                        min_trades=is_min_tr, precomputed=pre_is)
+                    is_r = backtest_mtf(df_htf, df_ent, inst, mode, slm, tpm, th,
+                                        min_trades=is_min_tr, precomputed=pre_full,
+                                        start_idx=60, end_idx=split_e)
                     if best_is_diag is None or is_r["profit_factor"] > best_is_diag["pf"]:
-                        best_is_diag = {"pf": is_r["profit_factor"], "t": is_r["trades"], "th": th}
+                        best_is_diag = {
+                            "pf": is_r["profit_factor"], "t": is_r["trades"],
+                            "slm": slm, "tpm": tpm, "th": th,
+                        }
                     if is_r["score"] <= -1e8 or is_r["profit_factor"] < GLOBAL["bt_min_profit_factor"]:
                         continue
-                    oos_r = backtest_mtf(df_htf_oos, df_ent_oos, inst, mode, slm, tpm, th,
-                                         min_trades=oos_min_tr, precomputed=pre_oos)
+                    oos_r = backtest_mtf(df_htf, df_ent, inst, mode, slm, tpm, th,
+                                         min_trades=oos_min_tr, precomputed=pre_full,
+                                         start_idx=split_e, end_idx=len(df_ent))
                     if oos_r["score"] <= -1e8 or oos_r["profit_factor"] < 0.90:
                         continue
                     ratio = (oos_r["score"] / is_r["score"]) if is_r["score"] > 0 else 0.0
@@ -1115,7 +1113,8 @@ def run_calibration(mode: str = "SWING") -> None:
                 "threshold": best["threshold"], "updated_at": now_utc_iso(),
             }
             full_r = backtest_mtf(df_htf, df_ent, inst, mode, best["sl_mult"], best["tp_mult"], best["threshold"],
-                                  min_trades=is_min_tr, precomputed=pre_full)
+                                  min_trades=is_min_tr, precomputed=pre_full,
+                                  start_idx=60, end_idx=len(df_ent))
             curves[inst] = full_r["equity_curve"]
             logging.info(
                 f"[cal] {inst} {mode} best={calibrated[f'{inst}:{mode}']} "
@@ -1128,9 +1127,14 @@ def run_calibration(mode: str = "SWING") -> None:
                 f"| PF <code>{full_r['profit_factor']:.2f}</code> | WR <code>{full_r['winrate']*100:.0f}%</code> ({full_r['trades']}t)"
             )
         else:
+            oos_diag = backtest_mtf(df_htf, df_ent, inst, mode,
+                                    best_is_diag["slm"], best_is_diag["tpm"], best_is_diag["th"],
+                                    min_trades=oos_min_tr, precomputed=pre_full,
+                                    start_idx=split_e, end_idx=len(df_ent))
             logging.info(
                 f"[cal-skip] {inst} {mode} no combo passed OOS walk-forward "
-                f"(best_is PF={best_is_diag['pf']:.2f} t={best_is_diag['t']} th={best_is_diag['th']})"
+                f"(best_is PF={best_is_diag['pf']:.2f} t={best_is_diag['t']} th={best_is_diag['th']} "
+                f"| oos PF={oos_diag['profit_factor']:.2f} t={oos_diag['trades']})"
             )
 
     with open(PARAMS_PATH, "w", encoding="utf-8") as f:
