@@ -1,14 +1,30 @@
 {
   "XAUUSD:SWING": {
-    "sl_mult": 2.5,
-    "tp_mult": 3.0,
+    "sl_mult": 2.2,
+    "tp_mult": 5.0,
+    "trail_mult": 1.5,
     "threshold": 68,
-    "updated_at": "2026-11-23T08:15:45Z"
+    "updated_at": "2026-11-23T12:21:28Z"
   },
   "BTCUSD:SWING": {
-    "sl_mult": 2.5,
-    "tp_mult": 3.0,
+    "sl_mult": 2.2,
+    "tp_mult": 5.0,
+    "trail_mult": 1.5,
+    "threshold": 65,
+    "updated_at": "2026-11-23T12:23:28Z"
+  },
+  "ETHUSD:SWING": {
+    "sl_mult": 1.8,
+    "tp_mult": 5.0,
+    "trail_mult": 1.5,
     "threshold": 68,
-    "updated_at": "2026-11-23T08:15:53Z"
+    "updated_at": "2026-11-23T12:24:03Z"
+  },
+  "NAS100:SCALPING": {
+    "sl_mult": 2.4,
+    "tp_mult": 4.2,
+    "trail_mult": 1.2,
+    "threshold": 68,
+    "updated_at": "2026-11-23T12:24:59Z"
   }
 }
