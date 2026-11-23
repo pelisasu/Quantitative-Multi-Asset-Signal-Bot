@@ -791,9 +791,11 @@ def db_init(conn: sqlite3.Connection) -> None:
 
 def send_telegram(text: str, chat_id: Optional[str] = None, retries: int = 4) -> bool:
     if not TELEGRAM_BOT_TOKEN:
+        logging.warning("[tg] TELEGRAM_BOT_TOKEN empty")
         return False
     cid = chat_id or TELEGRAM_CHAT_ID
     if not cid:
+        logging.warning("[tg] TELEGRAM_CHAT_ID empty")
         return False
     url, delay = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 1.0
     for _ in range(retries):
@@ -806,8 +808,9 @@ def send_telegram(text: str, chat_id: Optional[str] = None, retries: int = 4) ->
             if r.status_code == 429:
                 time.sleep(float(r.json().get("parameters", {}).get("retry_after", delay)))
                 continue
-        except Exception:
-            pass
+            logging.warning(f"[tg] HTTP {r.status_code}: {r.text[:160]}")
+        except Exception as e:
+            logging.warning(f"[tg] request error: {e}")
         time.sleep(delay)
         delay = min(delay * 2, 20.0)
     return False
@@ -825,51 +828,62 @@ def send_discord(text: str) -> bool:
 
 def monitor_open_trades(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT id, instrument, mode, direction, entry, sl, tp1, tp2, tp3, be_active "
+        "SELECT id, opened_ts, instrument, mode, direction, entry, sl, tp1, tp2, tp3, be_active "
         "FROM open_trades WHERE status='OPEN'"
     ).fetchall()
-    for tid, inst, mode, direction, entry, sl, tp1, tp2, tp3, be_active in rows:
+    for tid, opened_ts, inst, mode, direction, entry, sl, tp1, tp2, tp3, be_active in rows:
         if not market_open(inst):
             continue
         _, df_ent, _ = fetch_pair_locked(inst, mode)
         if df_ent is None or df_ent.empty:
             continue
-        last_hi = float(df_ent["High"].iloc[-1])
-        last_lo = float(df_ent["Low"].iloc[-1])
+        bar_sec = TIMEFRAMES[mode]["entry_sec"]
+        opened_dt = pd.Timestamp(_parse_ts(opened_ts))
+        fresh = df_ent[(df_ent.index + pd.Timedelta(seconds=bar_sec)) > opened_dt]
+        if fresh.empty:
+            continue
         risk_dist = max(abs(entry - sl), 1e-9)
 
-        if direction == "BUY":
-            active_sl = entry if be_active else sl
-            if last_lo <= active_sl:
-                status = "CLOSED_BE" if be_active else "CLOSED_SL"
-                r_res = 0.0 if be_active else -1.0
-                conn.execute("UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=? WHERE id=?",
-                             (status, now_utc_iso(), active_sl, r_res, tid))
-                send_telegram(f"🛑 <b>{inst} {mode} BUY</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.1f}R)")
-            elif last_hi >= tp3:
-                r_res = round((tp3 - entry) / risk_dist, 2)
-                conn.execute("UPDATE open_trades SET status='CLOSED_TP3', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
-                             (now_utc_iso(), tp3, r_res, tid))
-                send_telegram(f"🎯 <b>{inst} {mode} BUY</b> reached <b>TP3</b> @ <code>{tp3:.2f}</code> ({r_res:+.2f}R)")
-            elif not be_active and last_hi >= tp1:
-                conn.execute("UPDATE open_trades SET be_active=1 WHERE id=?", (tid,))
-                send_telegram(f"🔄 <b>{inst} {mode} BUY</b> hit TP1 @ <code>{tp1:.2f}</code> — SL moved to Breakeven (<code>{entry:.2f}</code>)")
-        else:
-            active_sl = entry if be_active else sl
-            if last_hi >= active_sl:
-                status = "CLOSED_BE" if be_active else "CLOSED_SL"
-                r_res = 0.0 if be_active else -1.0
-                conn.execute("UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=? WHERE id=?",
-                             (status, now_utc_iso(), active_sl, r_res, tid))
-                send_telegram(f"🛑 <b>{inst} {mode} SELL</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.1f}R)")
-            elif last_lo <= tp3:
-                r_res = round((entry - tp3) / risk_dist, 2)
-                conn.execute("UPDATE open_trades SET status='CLOSED_TP3', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
-                             (now_utc_iso(), tp3, r_res, tid))
-                send_telegram(f"🎯 <b>{inst} {mode} SELL</b> reached <b>TP3</b> @ <code>{tp3:.2f}</code> ({r_res:+.2f}R)")
-            elif not be_active and last_lo <= tp1:
-                conn.execute("UPDATE open_trades SET be_active=1 WHERE id=?", (tid,))
-                send_telegram(f"🔄 <b>{inst} {mode} SELL</b> hit TP1 @ <code>{tp1:.2f}</code> — SL moved to Breakeven (<code>{entry:.2f}</code>)")
+        for _, bar in fresh.iterrows():
+            hi, lo = float(bar["High"]), float(bar["Low"])
+            if direction == "BUY":
+                active_sl = entry if be_active else sl
+                if lo <= active_sl:
+                    status = "CLOSED_BE" if be_active else "CLOSED_SL"
+                    r_res = 0.0 if be_active else -1.0
+                    conn.execute("UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=? WHERE id=?",
+                                 (status, now_utc_iso(), active_sl, r_res, tid))
+                    send_telegram(f"🛑 <b>{inst} {mode} BUY</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.1f}R)")
+                    break
+                if hi >= tp3:
+                    r_res = round((tp3 - entry) / risk_dist, 2)
+                    conn.execute("UPDATE open_trades SET status='CLOSED_TP3', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
+                                 (now_utc_iso(), tp3, r_res, tid))
+                    send_telegram(f"🎯 <b>{inst} {mode} BUY</b> reached <b>TP3</b> @ <code>{tp3:.2f}</code> ({r_res:+.2f}R)")
+                    break
+                if not be_active and hi >= tp1:
+                    be_active = 1
+                    conn.execute("UPDATE open_trades SET be_active=1 WHERE id=?", (tid,))
+                    send_telegram(f"🔄 <b>{inst} {mode} BUY</b> hit TP1 @ <code>{tp1:.2f}</code> — SL moved to Breakeven (<code>{entry:.2f}</code>)")
+            else:
+                active_sl = entry if be_active else sl
+                if hi >= active_sl:
+                    status = "CLOSED_BE" if be_active else "CLOSED_SL"
+                    r_res = 0.0 if be_active else -1.0
+                    conn.execute("UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=? WHERE id=?",
+                                 (status, now_utc_iso(), active_sl, r_res, tid))
+                    send_telegram(f"🛑 <b>{inst} {mode} SELL</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.1f}R)")
+                    break
+                if lo <= tp3:
+                    r_res = round((entry - tp3) / risk_dist, 2)
+                    conn.execute("UPDATE open_trades SET status='CLOSED_TP3', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
+                                 (now_utc_iso(), tp3, r_res, tid))
+                    send_telegram(f"🎯 <b>{inst} {mode} SELL</b> reached <b>TP3</b> @ <code>{tp3:.2f}</code> ({r_res:+.2f}R)")
+                    break
+                if not be_active and lo <= tp1:
+                    be_active = 1
+                    conn.execute("UPDATE open_trades SET be_active=1 WHERE id=?", (tid,))
+                    send_telegram(f"🔄 <b>{inst} {mode} SELL</b> hit TP1 @ <code>{tp1:.2f}</code> — SL moved to Breakeven (<code>{entry:.2f}</code>)")
     conn.commit()
 
 def cooldown_ok(conn: sqlite3.Connection, inst: str, mode: str, direction: str) -> bool:
@@ -1000,8 +1014,9 @@ def run_live(conn: sqlite3.Connection) -> None:
                 f"📐 Lot: <code>{sig['lot']:.2f}</code>{warn_txt} | Skor: <code>{sig['score']}/100</code> | Regime: <code>{sig['regime']}</code>\n"
                 f"📊 ADX {sig['adx']:.1f} | RSI {sig['rsi']:.0f} | MAD-Z {sig['zscore']:+.1f} | Bar <code>{sig['bar_ts'][11:16]} UTC</code>"
             )
-            send_telegram(msg)
-            send_discord(msg)
+            tg_ok = send_telegram(msg)
+            dc_ok = send_discord(msg)
+            logging.info(f"[notify] {inst} {mode} {sig['direction']} | telegram={tg_ok} discord={dc_ok}")
             conn.execute(
                 "INSERT INTO signals(ts,instrument,mode,direction,entry,sl,tp1,tp2,tp3,lot,score,regime,message) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sig["ts"], inst, mode, sig["direction"], sig["entry"], sig["sl"],
