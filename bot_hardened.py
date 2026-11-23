@@ -72,29 +72,25 @@ ACCOUNT = {
 
 GLOBAL = {
     "min_score_signal":      68,
-    "max_entry_chase_atr":   1.8,    # |entry - EMA20| <= 1.8 * ATR
-    "max_mad_zscore":        2.5,
-    "bos_fresh_max_bars":    14,
-    "cooldown_same_min":     60,
-    "cooldown_flip_min":     120,
+    "donchian_bars":         20,
     "stale_max_min":         {"1m": 15, "5m": 25, "15m": 45, "1h": 150, "4h": 480},
     "closed_stale_extra_min": 4 * 24 * 60,
-    "spike_mad_threshold":   6.5,
-    "no_signal_if_choppy":   True,
+    "spike_mad_threshold":   9.0,
     "spread_pts":   {"XAUUSD": 0.35, "NAS100": 1.5, "BTCUSD": 15.0, "ETHUSD": 1.2},
     "slippage_pts": {"XAUUSD": 0.15, "NAS100": 0.5, "BTCUSD":  5.0, "ETHUSD": 0.4},
     # backtest
     "bt_risk_pct":           0.005,
     "bt_min_equity":         2000.0,
     "bt_max_dd_stop":        0.30,
-    "bt_min_trades":         15,
+    "bt_min_trades":         20,
     "bt_oos_fraction":       0.30,
     "bt_oos_min_ratio":      0.35,
-    "bt_min_profit_factor":  1.15,
+    "bt_min_profit_factor":  1.10,
+    "bt_oos_min_pf":         1.02,
 }
 
 # Lock sources as pairs (htf_source, entry_source) from the same feed/symbol so
-# HTF and Entry never mix Spot vs Futures (e.g., XAUUSD=X vs GC=F) or ^NDX vs QQQ.
+# HTF and Entry never mix Spot vs Futures (e.g., XAUUSD=X vs GC=F) or ^NDX vs NQ=F.
 INSTRUMENTS: Dict[str, Dict[str, Any]] = {
     "XAUUSD": {
         "source_groups": [
@@ -144,13 +140,15 @@ TIMEFRAMES = {
         "htf": "15m", "entry": "5m", "htf_sec": 900, "entry_sec": 300,
         "period_htf": "15d", "period_entry": "7d",
         "min_bars_htf": 120, "min_bars_entry": 160,
-        "sl_atr": 1.5, "tp_atr": [1.0, 2.0, 3.0], "max_hold_bars": 36,
+        "sl_atr": 1.8, "trail_atr": 1.2, "tp_atr": [1.8, 3.0, 4.0], "max_hold_bars": 48,
+        "cooldown_same_min": 60, "cooldown_flip_min": 120,
     },
     "SWING": {
-        "htf": "1h", "entry": "15m", "htf_sec": 3600, "entry_sec": 900,
-        "period_htf": "60d", "period_entry": "30d",
-        "min_bars_htf": 200, "min_bars_entry": 200,
-        "sl_atr": 2.5, "tp_atr": [1.5, 3.0, 4.5], "max_hold_bars": 48,
+        "htf": "4h", "entry": "1h", "htf_sec": 14400, "entry_sec": 3600,
+        "period_htf": "90d", "period_entry": "90d",
+        "min_bars_htf": 210, "min_bars_entry": 250,
+        "sl_atr": 2.5, "trail_atr": 1.5, "tp_atr": [2.5, 4.0, 5.0], "max_hold_bars": 96,
+        "cooldown_same_min": 120, "cooldown_flip_min": 240,
     },
 }
 
@@ -300,6 +298,20 @@ def sanitize_and_drop_unclosed(df: pd.DataFrame, interval: str, bar_sec: int,
         return None
     return df
 
+def resample_ohlcv(df: pd.DataFrame, rule_sec: int) -> Optional[pd.DataFrame]:
+    """Causally aggregate closed 1h OHLCV candles into 4h UTC-aligned buckets without look-ahead."""
+    if df is None or df.empty:
+        return None
+    freq = "4h" if rule_sec == 14400 else f"{rule_sec}s"
+    agg = df.resample(freq, origin="epoch").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }).dropna(subset=["Open", "High", "Low", "Close"])
+    return agg if not agg.empty else None
+
 def fetch_pair_locked(instrument: str, mode: str, history: bool = False
                       ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[str]]:
     """Fetch HTF and Entry STRICTLY from the same source_group to prevent spot/futures basis mismatch."""
@@ -307,22 +319,36 @@ def fetch_pair_locked(instrument: str, mode: str, history: bool = False
     tf  = TIMEFRAMES[mode]
     for src in cfg["source_groups"]:
         df_htf = df_ent = None
-        if src["type"] == "yfinance":
-            p_htf = "90d" if (history and tf["htf"] == "1h") else tf["period_htf"]
-            p_ent = "59d" if (history and tf["entry"] == "15m") else tf["period_entry"]
-            df_htf = fetch_yf(src["symbol"], tf["htf"],   p_htf, tf["min_bars_htf"])
-            df_ent = fetch_yf(src["symbol"], tf["entry"], p_ent, tf["min_bars_entry"])
-        elif src["type"] == "coinbase":
-            g_htf = COINBASE_GRAN.get(tf["htf"])
-            g_ent = COINBASE_GRAN.get(tf["entry"])
-            if g_htf and g_ent:
-                b_htf = 6 if history else 2
-                b_ent = 16 if history else 2
-                df_htf = fetch_coinbase(src["symbol"], g_htf, tf["min_bars_htf"], max_batches=b_htf)
-                df_ent = fetch_coinbase(src["symbol"], g_ent, tf["min_bars_entry"], max_batches=b_ent)
+        if mode == "SWING":
+            # Derive 4h HTF strictly from closed 1h candles of the identical feed (730d Yahoo / ~265d Coinbase)
+            min_ent = 500 if history else tf["min_bars_entry"]
+            if src["type"] == "yfinance":
+                p_ent = "730d" if history else tf["period_entry"]
+                df_ent = fetch_yf(src["symbol"], "1h", p_ent, min_ent)
+            elif src["type"] == "coinbase":
+                b_ent = 22 if history else 4
+                df_ent = fetch_coinbase(src["symbol"], 3600, min_ent, max_batches=b_ent)
+            df_ent = sanitize_and_drop_unclosed(df_ent, tf["entry"], tf["entry_sec"], min_ent, instrument)
+            if df_ent is not None:
+                df_htf = resample_ohlcv(df_ent, tf["htf_sec"])
+                df_htf = sanitize_and_drop_unclosed(df_htf, tf["htf"], tf["htf_sec"], tf["min_bars_htf"], instrument)
+        else:
+            if src["type"] == "yfinance":
+                p_htf = "59d" if history else tf["period_htf"]
+                p_ent = "59d" if history else tf["period_entry"]
+                df_htf = fetch_yf(src["symbol"], tf["htf"],   p_htf, tf["min_bars_htf"])
+                df_ent = fetch_yf(src["symbol"], tf["entry"], p_ent, tf["min_bars_entry"])
+            elif src["type"] == "coinbase":
+                g_htf = COINBASE_GRAN.get(tf["htf"])
+                g_ent = COINBASE_GRAN.get(tf["entry"])
+                if g_htf and g_ent:
+                    b_htf = 8 if history else 2
+                    b_ent = 14 if history else 2
+                    df_htf = fetch_coinbase(src["symbol"], g_htf, tf["min_bars_htf"], max_batches=b_htf)
+                    df_ent = fetch_coinbase(src["symbol"], g_ent, tf["min_bars_entry"], max_batches=b_ent)
+            df_htf = sanitize_and_drop_unclosed(df_htf, tf["htf"],   tf["htf_sec"],   tf["min_bars_htf"],   instrument)
+            df_ent = sanitize_and_drop_unclosed(df_ent, tf["entry"], tf["entry_sec"], tf["min_bars_entry"], instrument)
 
-        df_htf = sanitize_and_drop_unclosed(df_htf, tf["htf"],   tf["htf_sec"],   tf["min_bars_htf"],   instrument)
-        df_ent = sanitize_and_drop_unclosed(df_ent, tf["entry"], tf["entry_sec"], tf["min_bars_entry"], instrument)
         if df_htf is not None and df_ent is not None:
             mul, off = src.get("multiplier", 1.0), src.get("offset", 0.0)
             if mul != 1.0 or off != 0.0:
@@ -486,61 +512,59 @@ def _fresh_bos_bars_ago(htf_closes: np.ndarray, htf_sh: np.ndarray, htf_sl: np.n
 def evaluate_bar_pair(htf_df: pd.DataFrame, htf_sh: np.ndarray, htf_sl: np.ndarray, htf_idx: int,
                       ent_df: pd.DataFrame, ent_idx: int, threshold: int
                       ) -> Tuple[Optional[Tuple[str, int, str, Dict[str, float]]], str]:
-    if htf_idx < 60 or ent_idx < 60:
+    don_n = int(GLOBAL["donchian_bars"])
+    if htf_idx < 60 or ent_idx < max(60, don_n + 1):
         return None, "warmup<60"
     if not (spike_ok(htf_df, htf_idx) and spike_ok(ent_df, ent_idx)):
         return None, "spike_guard"
     if not (np.isfinite(htf_sh[htf_idx]) and np.isfinite(htf_sl[htf_idx])):
         return None, "awaiting_swing"
 
-    htf_row = htf_df.iloc[htf_idx]
-    ent_row = ent_df.iloc[ent_idx]
+    htf_row  = htf_df.iloc[htf_idx]
+    ent_row  = ent_df.iloc[ent_idx]
+    prev_ent = ent_df.iloc[ent_idx - 1]
     atr = float(ent_row["atr14"])
-    if not np.isfinite(atr) or atr <= 0:
-        return None, "invalid_atr"
+    he200 = float(htf_row["ema200"])
+    if not np.isfinite(atr) or atr <= 0 or not np.isfinite(he200):
+        return None, "invalid_atr_or_ema200"
 
     regime = detect_regime_row(htf_row)
-    if GLOBAL["no_signal_if_choppy"] and regime == "CHOPPY":
-        return None, f"CHOPPY(adx={float(htf_row['adx14']):.1f},er={float(htf_row['er20']):.2f})"
-
     htf_trend = 1 if float(htf_row["ema20"]) > float(htf_row["ema50"]) else -1
-    htf_closes = htf_df["Close"].to_numpy(dtype=float)
-    buy_bos  = _fresh_bos_bars_ago(htf_closes, htf_sh, htf_sl, htf_idx, "BUY")
-    sell_bos = _fresh_bos_bars_ago(htf_closes, htf_sh, htf_sl, htf_idx, "SELL")
+    hc, he50 = float(htf_row["Close"]), float(htf_row["ema50"])
+    ec, prev_c = float(ent_row["Close"]), float(prev_ent["Close"])
+
+    # Causal 20-bar Donchian Channel Breakout on Entry TF
+    hi20 = float(ent_df["High"].iloc[ent_idx - don_n : ent_idx].max())
+    lo20 = float(ent_df["Low"].iloc[ent_idx - don_n : ent_idx].min())
+    bull_brk = (ec > hi20) and (prev_c <= hi20)
+    bear_brk = (ec < lo20) and (prev_c >= lo20)
 
     sb = ss = 0
-    if htf_trend == 1: sb += 15
-    else:              ss += 15
-    hc, he50, he200 = float(htf_row["Close"]), float(htf_row["ema50"]), float(htf_row["ema200"])
-    if np.isfinite(he200):
-        if hc > he200 and he50 > he200: sb += 15
-        elif hc > he200:               sb += 8
-        if hc < he200 and he50 < he200: ss += 15
-        elif hc < he200:               ss += 8
-    max_bos = GLOBAL["bos_fresh_max_bars"]
-    if buy_bos  is not None: sb += 20 if buy_bos  <= max_bos else 8
-    if sell_bos is not None: ss += 20 if sell_bos <= max_bos else 8
+    # 1. HTF EMA20/50 Trend (+20)
+    if htf_trend == 1: sb += 20
+    else:              ss += 20
+    # 2. Macro EMA200 Alignment (+20 full / +12 close-only)
+    if hc > he200 and he50 > he200: sb += 20
+    elif hc > he200:               sb += 12
+    if hc < he200 and he50 < he200: ss += 20
+    elif hc < he200:               ss += 12
+    # 3. Entry 20-Bar Donchian Channel Breakout (+25)
+    if bull_brk: sb += 25
+    if bear_brk: ss += 25
+    # 4. HTF Causal Swing Structure (+10)
+    if hc > float(htf_sh[htf_idx]): sb += 10
+    if hc < float(htf_sl[htf_idx]): ss += 10
+    # 5. Directional ADX / DMI Quality (+15 TREND / +8 early DI)
     pdi, mdi, adx = float(htf_row["plus_di"]), float(htf_row["minus_di"]), float(htf_row["adx14"])
-    if regime == "TREND" and pdi > mdi:   sb += 15
-    elif pdi > mdi and adx >= 18.0:       sb += 7
-    if regime == "TREND" and mdi > pdi:   ss += 15
-    elif mdi > pdi and adx >= 18.0:       ss += 7
-    ec, ee20, slope = float(ent_row["Close"]), float(ent_row["ema20"]), float(ent_row["slope20"])
-    dist_atr = abs(ec - ee20) / atr
-    if ec > ee20 and slope > 0: sb += 15 if dist_atr <= 1.25 else 8
-    if ec < ee20 and slope < 0: ss += 15 if dist_atr <= 1.25 else 8
-    rsi = float(ent_row["rsi14"])
-    if 48.0 <= rsi <= 68.0:   sb += 10
-    elif 68.0 < rsi < 74.0:   sb += 4
-    if 32.0 <= rsi <= 52.0:   ss += 10
-    elif 26.0 < rsi < 32.0:   ss += 4
-    bull = float(ent_row["Close"]) > float(ent_row["Open"])
-    wb, ws = _wick_rejection(ent_row)
-    if bull:
-        sb += 10 if wb else 5
-    else:
-        ss += 10 if ws else 5
+    if pdi > mdi: sb += 15 if regime == "TREND" else 8
+    if mdi > pdi: ss += 15 if regime == "TREND" else 8
+    # 6. Entry EMA20 Momentum (+10)
+    ee20, slope = float(ent_row["ema20"]), float(ent_row["slope20"])
+    if ec > ee20 and slope > 0: sb += 10
+    if ec < ee20 and slope < 0: ss += 10
 
+    rsi = float(ent_row["rsi14"])
+    mad_z = float(ent_row["mad_zscore20"]) if np.isfinite(ent_row["mad_zscore20"]) else 0.0
     diag = f"regime={regime} adx={adx:.1f} er={float(htf_row['er20']):.2f} rsi={rsi:.1f} sb={sb} ss={ss}"
 
     if htf_trend == 1 and sb >= threshold and sb >= ss + 10:
@@ -550,19 +574,10 @@ def evaluate_bar_pair(htf_df: pd.DataFrame, htf_sh: np.ndarray, htf_sl: np.ndarr
     else:
         return None, f"{diag} (score<{threshold})"
 
-    # Macro EMA200 Tiered Gate: aligned setups use threshold; counter-EMA200 reversals require >= 78
-    counter_th = max(78, threshold + 10)
-    if np.isfinite(he200):
-        if direction == "BUY" and hc <= he200 and score < counter_th:
-            return None, f"{diag} (counter-EMA200 {score}<{counter_th})"
-        if direction == "SELL" and hc >= he200 and score < counter_th:
-            return None, f"{diag} (counter-EMA200 {score}<{counter_th})"
-
-    mad_z = float(ent_row["mad_zscore20"]) if np.isfinite(ent_row["mad_zscore20"]) else 0.0
-    if dist_atr > GLOBAL["max_entry_chase_atr"]:
-        return None, f"{diag} (chase {dist_atr:.2f}>{GLOBAL['max_entry_chase_atr']} ATR)"
-    if abs(mad_z) >= GLOBAL["max_mad_zscore"]:
-        return None, f"{diag} (mad_z {mad_z:+.2f})"
+    if (direction == "BUY" and not bull_brk) or (direction == "SELL" and not bear_brk):
+        return None, f"{diag} (awaiting 20-bar breakout)"
+    if (direction == "BUY" and hc <= he200) or (direction == "SELL" and hc >= he200):
+        return None, f"{diag} (counter-EMA200 {hc:.2f} vs {he200:.2f})"
 
     return (direction, int(min(100, score)), regime, {
         "atr": atr, "rsi": rsi, "mad_z": mad_z, "adx": adx,
@@ -610,7 +625,8 @@ def evaluate_signal(instrument: str, mode: str,
     threshold = int(cal.get("threshold", GLOBAL["min_score_signal"]))
     sl_mult   = float(cal.get("sl_mult", tf["sl_atr"]))
     tp2_mult  = float(cal.get("tp_mult", tf["tp_atr"][1]))
-    tp3_mult  = max(float(tf["tp_atr"][2]), round(tp2_mult * 1.5, 2))
+    trail_mult = float(cal.get("trail_mult", tf["trail_atr"]))
+    tp3_mult  = max(float(tf["tp_atr"][2]), round(tp2_mult * 1.25, 2))
 
     res, diag = evaluate_bar_pair(df_htf, htf_sh, htf_sl, len(df_htf) - 1,
                                   df_ent, len(df_ent) - 1, threshold)
@@ -624,12 +640,12 @@ def evaluate_signal(instrument: str, mode: str,
 
     if direction == "BUY":
         sl  = entry - sl_mult * atr
-        tp1 = entry + tf["tp_atr"][0] * atr
+        tp1 = entry + sl_mult * atr       # 1.0R ATR Chandelier Trail trigger level
         tp2 = entry + tp2_mult * atr
         tp3 = entry + tp3_mult * atr
     else:
         sl  = entry + sl_mult * atr
-        tp1 = entry - tf["tp_atr"][0] * atr
+        tp1 = entry - sl_mult * atr
         tp2 = entry - tp2_mult * atr
         tp3 = entry - tp3_mult * atr
 
@@ -641,6 +657,7 @@ def evaluate_signal(instrument: str, mode: str,
         "instrument": instrument, "mode": mode, "direction": direction,
         "entry": round(entry, 4), "sl": round(sl, 4),
         "tp1": round(tp1, 4), "tp2": round(tp2, 4), "tp3": round(tp3, 4),
+        "trail_dist": round(trail_mult * atr, 4),
         "lot": lot, "risk_warn": risk_warn, "score": score, "regime": regime,
         "source": src, "atr": round(atr, 4), "rsi": round(ctx["rsi"], 1),
         "adx": round(ctx["adx"], 1), "zscore": round(ctx["mad_z"], 2),
@@ -668,6 +685,7 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
     spread = float(GLOBAL["spread_pts"].get(instrument, 1.0))
     slip   = float(GLOBAL["slippage_pts"].get(instrument, 0.1))
     risk_frac = float(GLOBAL["bt_risk_pct"])
+    trail_mult = float(tf["trail_atr"])
 
     if precomputed is not None:
         df_htf, df_ent, htf_sh, htf_sl = precomputed
@@ -704,7 +722,7 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
         direction, _, _, ctx = res
 
         if last_dir is not None:
-            cd_min = GLOBAL["cooldown_same_min"] if last_dir == direction else GLOBAL["cooldown_flip_min"]
+            cd_min = tf["cooldown_same_min"] if last_dir == direction else tf["cooldown_flip_min"]
             if (ent_open_ts[i] - last_exit_ts) / 60.0 < cd_min:
                 i += 1
                 continue
@@ -713,17 +731,15 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
         next_open = float(df_ent["Open"].iloc[enter_idx])
         atr = ctx["atr"]
         sl_dist = sl_mult * atr
-        tp1_dist = tf["tp_atr"][0] * atr
+        trail_dist = trail_mult * atr
 
         fill = (next_open + spread / 2.0 + slip) if direction == "BUY" else (next_open - spread / 2.0 - slip)
         sl_orig = (fill - sl_dist) if direction == "BUY" else (fill + sl_dist)
-        tp1     = (fill + tp1_dist) if direction == "BUY" else (fill - tp1_dist)
         tp_tgt  = (fill + tp_target_mult * atr) if direction == "BUY" else (fill - tp_target_mult * atr)
 
         active_sl = sl_orig
         moved_be  = False
-        realized_partial = 0.0
-        rem_frac = 1.0
+        max_fav   = fill
         units = (equity * risk_frac) / max(sl_dist, 1e-9)
         max_j = min(enter_idx + tf["max_hold_bars"], n_ent - 1)
         exit_px, exit_reason, exit_j = float(df_ent["Close"].iloc[max_j]), "TIMEOUT", max_j
@@ -736,28 +752,26 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
                 bo, bl, bh = o - spread / 2.0, l - spread / 2.0, h - spread / 2.0
                 if bo <= active_sl: exit_px, exit_reason, exit_j = bo - slip, ("BE" if moved_be else "SL"), j; break
                 if bl <= active_sl: exit_px, exit_reason, exit_j = active_sl - slip, ("BE" if moved_be else "SL"), j; break
-                if not moved_be and bh >= tp1:
+                if bh >= tp_tgt:    exit_px, exit_reason, exit_j = tp_tgt, "TP", j; break
+                if bh > max_fav: max_fav = bh
+                if (max_fav - fill) >= sl_dist:
                     moved_be = True
-                    realized_partial += (tp1 - fill) * (units * 0.5)
-                    rem_frac = 0.5
-                    active_sl = fill
-                if bh >= tp_tgt: exit_px, exit_reason, exit_j = tp_tgt, "TP", j; break
+                    active_sl = max(active_sl, fill + 0.05 * sl_dist, max_fav - trail_dist)
             else:
                 ao, ah, al = o + spread / 2.0, h + spread / 2.0, l + spread / 2.0
                 if ao >= active_sl: exit_px, exit_reason, exit_j = ao + slip, ("BE" if moved_be else "SL"), j; break
                 if ah >= active_sl: exit_px, exit_reason, exit_j = active_sl + slip, ("BE" if moved_be else "SL"), j; break
-                if not moved_be and al <= tp1:
+                if al <= tp_tgt:    exit_px, exit_reason, exit_j = tp_tgt, "TP", j; break
+                if al < max_fav: max_fav = al
+                if (fill - max_fav) >= sl_dist:
                     moved_be = True
-                    realized_partial += (fill - tp1) * (units * 0.5)
-                    rem_frac = 0.5
-                    active_sl = fill
-                if al <= tp_tgt: exit_px, exit_reason, exit_j = tp_tgt, "TP", j; break
+                    active_sl = min(active_sl, fill - 0.05 * sl_dist, max_fav + trail_dist)
             if j == max_j:
                 c = float(df_ent["Close"].iloc[j])
                 exit_px = (c - spread / 2.0 - slip) if direction == "BUY" else (c + spread / 2.0 + slip)
 
         risk_amt = max(equity * risk_frac, 1e-9)
-        pnl = realized_partial + ((exit_px - fill) if direction == "BUY" else (fill - exit_px)) * (units * rem_frac)
+        pnl = ((exit_px - fill) if direction == "BUY" else (fill - exit_px)) * units
         equity += pnl
         peak = max(peak, equity)
         curve.append(equity)
@@ -803,7 +817,8 @@ def db_init(conn: sqlite3.Connection) -> None:
         direction TEXT NOT NULL, entry REAL NOT NULL, sl REAL NOT NULL,
         tp1 REAL NOT NULL, tp2 REAL NOT NULL, tp3 REAL NOT NULL,
         lot REAL NOT NULL, be_active INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'OPEN', closed_ts TEXT, exit_price REAL, r_result REAL
+        status TEXT DEFAULT 'OPEN', closed_ts TEXT, exit_price REAL, r_result REAL,
+        trail_dist REAL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS cooldown (
         instrument TEXT NOT NULL, mode TEXT NOT NULL, direction TEXT NOT NULL,
@@ -811,6 +826,10 @@ def db_init(conn: sqlite3.Connection) -> None:
     );
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
     """)
+    try:
+        conn.execute("ALTER TABLE open_trades ADD COLUMN trail_dist REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 def send_telegram(text: str, chat_id: Optional[str] = None, retries: int = 4) -> bool:
@@ -852,62 +871,77 @@ def send_discord(text: str) -> bool:
 
 def monitor_open_trades(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT id, opened_ts, instrument, mode, direction, entry, sl, tp1, tp2, tp3, be_active "
+        "SELECT id, opened_ts, instrument, mode, direction, entry, sl, tp1, tp2, tp3, be_active, trail_dist "
         "FROM open_trades WHERE status='OPEN'"
     ).fetchall()
-    for tid, opened_ts, inst, mode, direction, entry, sl, tp1, tp2, tp3, be_active in rows:
+    for tid, opened_ts, inst, mode, direction, entry, sl, tp1, tp2, tp3, be_active, trail_dist in rows:
         if not market_open(inst):
             continue
         _, df_ent, _ = fetch_pair_locked(inst, mode)
         if df_ent is None or df_ent.empty:
             continue
-        bar_sec = TIMEFRAMES[mode]["entry_sec"]
+        tf = TIMEFRAMES[mode]
+        bar_sec = tf["entry_sec"]
         opened_sec = _parse_ts(opened_ts).timestamp()
         fresh = df_ent[(_to_epoch_sec(df_ent.index) + bar_sec) > opened_sec]
         if fresh.empty:
             continue
-        risk_dist = max(abs(entry - sl), 1e-9)
+
+        orig_risk = max(abs(tp1 - entry), abs(entry - sl), 1e-9)
+        t_dist = float(trail_dist) if trail_dist and float(trail_dist) > 0 else orig_risk * (tf["trail_atr"] / tf["sl_atr"])
+        active_sl = float(sl)
+        be_on = int(be_active or 0)
 
         for _, bar in fresh.iterrows():
             hi, lo = float(bar["High"]), float(bar["Low"])
             if direction == "BUY":
-                active_sl = entry if be_active else sl
                 if lo <= active_sl:
-                    status = "CLOSED_BE" if be_active else "CLOSED_SL"
-                    r_res = 0.0 if be_active else -1.0
+                    r_res = round((active_sl - entry) / orig_risk, 2)
+                    status = "CLOSED_TRAIL" if be_on else "CLOSED_SL"
                     conn.execute("UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=? WHERE id=?",
                                  (status, now_utc_iso(), active_sl, r_res, tid))
-                    send_telegram(f"🛑 <b>{inst} {mode} BUY</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.1f}R)")
+                    send_telegram(f"🛑 <b>{inst} {mode} BUY</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.2f}R)")
                     break
-                if hi >= tp3:
-                    r_res = round((tp3 - entry) / risk_dist, 2)
-                    conn.execute("UPDATE open_trades SET status='CLOSED_TP3', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
-                                 (now_utc_iso(), tp3, r_res, tid))
-                    send_telegram(f"🎯 <b>{inst} {mode} BUY</b> reached <b>TP3</b> @ <code>{tp3:.2f}</code> ({r_res:+.2f}R)")
+                if hi >= tp2:
+                    r_res = round((tp2 - entry) / orig_risk, 2)
+                    conn.execute("UPDATE open_trades SET status='CLOSED_TP2', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
+                                 (now_utc_iso(), tp2, r_res, tid))
+                    send_telegram(f"🎯 <b>{inst} {mode} BUY</b> reached <b>TP2</b> @ <code>{tp2:.2f}</code> ({r_res:+.2f}R)")
                     break
-                if not be_active and hi >= tp1:
-                    be_active = 1
-                    conn.execute("UPDATE open_trades SET be_active=1 WHERE id=?", (tid,))
-                    send_telegram(f"🔄 <b>{inst} {mode} BUY</b> hit TP1 @ <code>{tp1:.2f}</code> — SL moved to Breakeven (<code>{entry:.2f}</code>)")
+                if (hi - entry) >= orig_risk:
+                    new_sl = max(active_sl, entry + 0.05 * orig_risk, hi - t_dist)
+                    if not be_on:
+                        be_on = 1
+                        active_sl = new_sl
+                        conn.execute("UPDATE open_trades SET be_active=1, sl=? WHERE id=?", (round(active_sl, 4), tid))
+                        send_telegram(f"🔄 <b>{inst} {mode} BUY</b> hit +1R @ <code>{tp1:.2f}</code> — ATR Trail active (SL <code>{active_sl:.2f}</code>)")
+                    elif new_sl > active_sl:
+                        active_sl = new_sl
+                        conn.execute("UPDATE open_trades SET sl=? WHERE id=?", (round(active_sl, 4), tid))
             else:
-                active_sl = entry if be_active else sl
                 if hi >= active_sl:
-                    status = "CLOSED_BE" if be_active else "CLOSED_SL"
-                    r_res = 0.0 if be_active else -1.0
+                    r_res = round((entry - active_sl) / orig_risk, 2)
+                    status = "CLOSED_TRAIL" if be_on else "CLOSED_SL"
                     conn.execute("UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=? WHERE id=?",
                                  (status, now_utc_iso(), active_sl, r_res, tid))
-                    send_telegram(f"🛑 <b>{inst} {mode} SELL</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.1f}R)")
+                    send_telegram(f"🛑 <b>{inst} {mode} SELL</b> hit <b>{status}</b> @ <code>{active_sl:.2f}</code> ({r_res:+.2f}R)")
                     break
-                if lo <= tp3:
-                    r_res = round((entry - tp3) / risk_dist, 2)
-                    conn.execute("UPDATE open_trades SET status='CLOSED_TP3', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
-                                 (now_utc_iso(), tp3, r_res, tid))
-                    send_telegram(f"🎯 <b>{inst} {mode} SELL</b> reached <b>TP3</b> @ <code>{tp3:.2f}</code> ({r_res:+.2f}R)")
+                if lo <= tp2:
+                    r_res = round((entry - tp2) / orig_risk, 2)
+                    conn.execute("UPDATE open_trades SET status='CLOSED_TP2', closed_ts=?, exit_price=?, r_result=? WHERE id=?",
+                                 (now_utc_iso(), tp2, r_res, tid))
+                    send_telegram(f"🎯 <b>{inst} {mode} SELL</b> reached <b>TP2</b> @ <code>{tp2:.2f}</code> ({r_res:+.2f}R)")
                     break
-                if not be_active and lo <= tp1:
-                    be_active = 1
-                    conn.execute("UPDATE open_trades SET be_active=1 WHERE id=?", (tid,))
-                    send_telegram(f"🔄 <b>{inst} {mode} SELL</b> hit TP1 @ <code>{tp1:.2f}</code> — SL moved to Breakeven (<code>{entry:.2f}</code>)")
+                if (entry - lo) >= orig_risk:
+                    new_sl = min(active_sl, entry - 0.05 * orig_risk, lo + t_dist)
+                    if not be_on:
+                        be_on = 1
+                        active_sl = new_sl
+                        conn.execute("UPDATE open_trades SET be_active=1, sl=? WHERE id=?", (round(active_sl, 4), tid))
+                        send_telegram(f"🔄 <b>{inst} {mode} SELL</b> hit +1R @ <code>{tp1:.2f}</code> — ATR Trail active (SL <code>{active_sl:.2f}</code>)")
+                    elif new_sl < active_sl:
+                        active_sl = new_sl
+                        conn.execute("UPDATE open_trades SET sl=? WHERE id=?", (round(active_sl, 4), tid))
     conn.commit()
 
 def cooldown_ok(conn: sqlite3.Connection, inst: str, mode: str, direction: str) -> bool:
@@ -923,8 +957,9 @@ def cooldown_ok(conn: sqlite3.Connection, inst: str, mode: str, direction: str) 
     if not row:
         return True
     last_dir, last_ts = row
+    tf = TIMEFRAMES[mode]
     age_min = (now_utc() - _parse_ts(last_ts)).total_seconds() / 60.0
-    return age_min >= (GLOBAL["cooldown_same_min"] if last_dir == direction else GLOBAL["cooldown_flip_min"])
+    return age_min >= (tf["cooldown_same_min"] if last_dir == direction else tf["cooldown_flip_min"])
 
 def get_state(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:
     row = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
@@ -1047,9 +1082,9 @@ def run_live(conn: sqlite3.Connection) -> None:
                  sig["tp1"], sig["tp2"], sig["tp3"], sig["lot"], sig["score"], sig["regime"], msg)
             )
             conn.execute(
-                "INSERT INTO open_trades(opened_ts,instrument,mode,direction,entry,sl,tp1,tp2,tp3,lot) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO open_trades(opened_ts,instrument,mode,direction,entry,sl,tp1,tp2,tp3,lot,trail_dist) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (sig["ts"], inst, mode, sig["direction"], sig["entry"], sig["sl"],
-                 sig["tp1"], sig["tp2"], sig["tp3"], sig["lot"])
+                 sig["tp1"], sig["tp2"], sig["tp3"], sig["lot"], sig["trail_dist"])
             )
             conn.execute(
                 "INSERT INTO cooldown(instrument,mode,direction,last_ts) VALUES(?,?,?,?) "
@@ -1062,12 +1097,13 @@ def run_calibration(mode: str = "SWING") -> None:
     calibrated = load_calibrated_params()
     curves: Dict[str, List[float]] = {}
     summary_lines: List[str] = []
-    is_min_tr  = max(10, int(GLOBAL["bt_min_trades"] * 0.65))
-    oos_min_tr = max(4,  int(GLOBAL["bt_min_trades"] * 0.25))
+    tf = TIMEFRAMES[mode]
+    is_min_tr  = max(15, int(GLOBAL["bt_min_trades"] * 0.70))
+    oos_min_tr = max(6,  int(GLOBAL["bt_min_trades"] * 0.25))
 
     for inst in INSTRUMENTS:
         df_htf, df_ent, src = fetch_pair_locked(inst, mode, history=True)
-        if df_htf is None or df_ent is None or len(df_ent) < 260:
+        if df_htf is None or df_ent is None or len(df_ent) < 500:
             logging.info(f"[cal-skip] {inst} {mode} insufficient history (ent={0 if df_ent is None else len(df_ent)})")
             continue
         logging.info(f"[cal-scan] {inst} {mode} src={src} htf={len(df_htf)} ent={len(df_ent)}")
@@ -1083,9 +1119,9 @@ def run_calibration(mode: str = "SWING") -> None:
 
         best = None
         best_is_diag: Optional[Dict[str, Any]] = None
-        for slm in (1.5, 2.0, 2.5):
-            for tpm in (2.0, 3.0):
-                for th in (65, 68, 74):
+        for slm in (2.0, 2.5):
+            for tpm in (3.0, 3.5, 4.0):
+                for th in (65, 68, 72):
                     is_r = backtest_mtf(df_htf, df_ent, inst, mode, slm, tpm, th,
                                         min_trades=is_min_tr, precomputed=pre_full,
                                         start_idx=60, end_idx=split_e)
@@ -1099,7 +1135,7 @@ def run_calibration(mode: str = "SWING") -> None:
                     oos_r = backtest_mtf(df_htf, df_ent, inst, mode, slm, tpm, th,
                                          min_trades=oos_min_tr, precomputed=pre_full,
                                          start_idx=split_e, end_idx=len(df_ent))
-                    if oos_r["score"] <= -1e8 or oos_r["profit_factor"] < 0.90:
+                    if oos_r["score"] <= -1e8 or oos_r["profit_factor"] < GLOBAL["bt_oos_min_pf"]:
                         continue
                     ratio = (oos_r["score"] / is_r["score"]) if is_r["score"] > 0 else 0.0
                     if ratio < GLOBAL["bt_oos_min_ratio"]:
@@ -1110,7 +1146,8 @@ def run_calibration(mode: str = "SWING") -> None:
         if best:
             calibrated[f"{inst}:{mode}"] = {
                 "sl_mult": best["sl_mult"], "tp_mult": best["tp_mult"],
-                "threshold": best["threshold"], "updated_at": now_utc_iso(),
+                "trail_mult": tf["trail_atr"], "threshold": best["threshold"],
+                "updated_at": now_utc_iso(),
             }
             full_r = backtest_mtf(df_htf, df_ent, inst, mode, best["sl_mult"], best["tp_mult"], best["threshold"],
                                   min_trades=is_min_tr, precomputed=pre_full,
@@ -1123,7 +1160,7 @@ def run_calibration(mode: str = "SWING") -> None:
                 f"FULL(t={full_r['trades']},PF={full_r['profit_factor']:.2f},WR={full_r['winrate']:.1%})"
             )
             summary_lines.append(
-                f"• <b>{inst}</b>: th=<code>{best['threshold']}</code> sl=<code>{best['sl_mult']}</code> "
+                f"• <b>{inst}</b>: th=<code>{best['threshold']}</code> sl=<code>{best['sl_mult']}</code> tp=<code>{best['tp_mult']}</code> "
                 f"| PF <code>{full_r['profit_factor']:.2f}</code> | WR <code>{full_r['winrate']*100:.0f}%</code> ({full_r['trades']}t)"
             )
         else:
