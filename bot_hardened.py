@@ -474,23 +474,23 @@ def _fresh_bos_bars_ago(htf_closes: np.ndarray, swing_levels: np.ndarray,
 
 def evaluate_bar_pair(htf_df: pd.DataFrame, htf_sh: np.ndarray, htf_sl: np.ndarray, htf_idx: int,
                       ent_df: pd.DataFrame, ent_idx: int, threshold: int
-                      ) -> Optional[Tuple[str, int, str, Dict[str, float]]]:
+                      ) -> Tuple[Optional[Tuple[str, int, str, Dict[str, float]]], str]:
     if htf_idx < 60 or ent_idx < 60:
-        return None
+        return None, "warmup<60"
     if not (spike_ok(htf_df, htf_idx) and spike_ok(ent_df, ent_idx)):
-        return None
+        return None, "spike_guard"
     if not (np.isfinite(htf_sh[htf_idx]) and np.isfinite(htf_sl[htf_idx])):
-        return None
+        return None, "awaiting_swing"
 
     htf_row = htf_df.iloc[htf_idx]
     ent_row = ent_df.iloc[ent_idx]
     atr = float(ent_row["atr14"])
     if not np.isfinite(atr) or atr <= 0:
-        return None
+        return None, "invalid_atr"
 
     regime = detect_regime_row(htf_row)
     if GLOBAL["no_signal_if_choppy"] and regime == "CHOPPY":
-        return None
+        return None, f"CHOPPY(adx={float(htf_row['adx14']):.1f},er={float(htf_row['er20']):.2f})"
 
     htf_trend = 1 if float(htf_row["ema20"]) > float(htf_row["ema50"]) else -1
     htf_closes = htf_df["Close"].to_numpy(dtype=float)
@@ -498,38 +498,31 @@ def evaluate_bar_pair(htf_df: pd.DataFrame, htf_sh: np.ndarray, htf_sl: np.ndarr
     sell_bos = _fresh_bos_bars_ago(htf_closes, htf_sl, htf_idx, "SELL")
 
     sb = ss = 0
-    # 1. HTF EMA20/50 (+15)
     if htf_trend == 1: sb += 15
     else:              ss += 15
-    # 2. Macro EMA200 (+15 / +8)
     hc, he50, he200 = float(htf_row["Close"]), float(htf_row["ema50"]), float(htf_row["ema200"])
     if np.isfinite(he200):
         if hc > he200 and he50 > he200: sb += 15
         elif hc > he200:               sb += 8
         if hc < he200 and he50 < he200: ss += 15
         elif hc < he200:               ss += 8
-    # 3. Fresh Causal BOS (+20 / +8)
     max_bos = GLOBAL["bos_fresh_max_bars"]
     if buy_bos  is not None: sb += 20 if buy_bos  <= max_bos else 8
     if sell_bos is not None: ss += 20 if sell_bos <= max_bos else 8
-    # 4. Directional ADX/ER (+15 / +7) — ZERO shared symmetry inflation!
     pdi, mdi, adx = float(htf_row["plus_di"]), float(htf_row["minus_di"]), float(htf_row["adx14"])
     if regime == "TREND" and pdi > mdi:   sb += 15
     elif pdi > mdi and adx >= 18.0:       sb += 7
     if regime == "TREND" and mdi > pdi:   ss += 15
     elif mdi > pdi and adx >= 18.0:       ss += 7
-    # 5. Entry Value Zone & Slope (+15 / +8)
     ec, ee20, slope = float(ent_row["Close"]), float(ent_row["ema20"]), float(ent_row["slope20"])
     dist_atr = abs(ec - ee20) / atr
     if ec > ee20 and slope > 0: sb += 15 if dist_atr <= 1.25 else 8
     if ec < ee20 and slope < 0: ss += 15 if dist_atr <= 1.25 else 8
-    # 6. Wilder RSI Sweet Spot (+10 / +4)
     rsi = float(ent_row["rsi14"])
     if 48.0 <= rsi <= 68.0:   sb += 10
     elif 68.0 < rsi < 74.0:   sb += 4
     if 32.0 <= rsi <= 52.0:   ss += 10
     elif 26.0 < rsi < 32.0:   ss += 4
-    # 7. Candle Conviction & Wick Rejection (+10 / +5)
     bull = float(ent_row["Close"]) > float(ent_row["Open"])
     wb, ws = _wick_rejection(ent_row)
     if bull:
@@ -537,30 +530,33 @@ def evaluate_bar_pair(htf_df: pd.DataFrame, htf_sh: np.ndarray, htf_sl: np.ndarr
     else:
         ss += 10 if ws else 5
 
+    diag = f"regime={regime} adx={adx:.1f} er={float(htf_row['er20']):.2f} rsi={rsi:.1f} sb={sb} ss={ss}"
+
     if htf_trend == 1 and sb >= threshold and sb >= ss + 10:
         direction, score = "BUY", sb
     elif htf_trend == -1 and ss >= threshold and ss >= sb + 10:
         direction, score = "SELL", ss
     else:
-        return None
+        return None, f"{diag} (score<{threshold})"
 
-    # Macro EMA200 directional gate
+    # Macro EMA200 Tiered Gate: aligned setups use threshold; counter-EMA200 reversals require >= 78
+    counter_th = max(78, threshold + 10)
     if np.isfinite(he200):
-        if direction == "BUY" and hc <= he200:
-            return None
-        if direction == "SELL" and hc >= he200:
-            return None
+        if direction == "BUY" and hc <= he200 and score < counter_th:
+            return None, f"{diag} (counter-EMA200 {score}<{counter_th})"
+        if direction == "SELL" and hc >= he200 and score < counter_th:
+            return None, f"{diag} (counter-EMA200 {score}<{counter_th})"
 
     mad_z = float(ent_row["mad_zscore20"]) if np.isfinite(ent_row["mad_zscore20"]) else 0.0
     if dist_atr > GLOBAL["max_entry_chase_atr"]:
-        return None
+        return None, f"{diag} (chase {dist_atr:.2f}>{GLOBAL['max_entry_chase_atr']} ATR)"
     if abs(mad_z) >= GLOBAL["max_mad_zscore"]:
-        return None
+        return None, f"{diag} (mad_z {mad_z:+.2f})"
 
-    return direction, int(min(100, score)), regime, {
+    return (direction, int(min(100, score)), regime, {
         "atr": atr, "rsi": rsi, "mad_z": mad_z, "adx": adx,
         "er": float(htf_row["er20"]), "entry": ec,
-    }
+    }), diag
 
 def calc_lot(balance: float, risk_pct: float, sl_dist: float,
              contract: Dict[str, Any]) -> Tuple[float, bool]:
@@ -587,9 +583,11 @@ def load_calibrated_params() -> Dict[str, Any]:
 def evaluate_signal(instrument: str, mode: str,
                     calibrated: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     if mode == "SCALPING" and not scalping_session_ok(instrument):
+        logging.info(f"[eval] {instrument} {mode} | skip: outside scalp session")
         return None
     df_htf, df_ent, src = fetch_pair_locked(instrument, mode)
     if df_htf is None or df_ent is None:
+        logging.info(f"[eval] {instrument} {mode} | skip: no fresh/sufficient data")
         return None
 
     df_htf = compute_indicators(df_htf)
@@ -601,11 +599,14 @@ def evaluate_signal(instrument: str, mode: str,
     threshold = int(cal.get("threshold", GLOBAL["min_score_signal"]))
     sl_mult   = float(cal.get("sl_mult", tf["sl_atr"]))
 
-    res = evaluate_bar_pair(df_htf, htf_sh, htf_sl, len(df_htf) - 1,
-                            df_ent, len(df_ent) - 1, threshold)
+    res, diag = evaluate_bar_pair(df_htf, htf_sh, htf_sl, len(df_htf) - 1,
+                                  df_ent, len(df_ent) - 1, threshold)
+    close_px = float(df_ent["Close"].iloc[-1])
     if res is None:
+        logging.info(f"[eval] {instrument} {mode} | src={src} close={close_px:.2f} | {diag}")
         return None
     direction, score, regime, ctx = res
+    logging.info(f"[eval] {instrument} {mode} | src={src} close={close_px:.2f} | SIGNAL {direction} {score}/100 ({diag})")
     entry, atr = ctx["entry"], ctx["atr"]
 
     if direction == "BUY":
@@ -669,7 +670,7 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
             i += 1
             continue
 
-        res = evaluate_bar_pair(df_htf, htf_sh, htf_sl, htf_ptr, df_ent, i, threshold)
+        res, _ = evaluate_bar_pair(df_htf, htf_sh, htf_sl, htf_ptr, df_ent, i, threshold)
         if res is None:
             i += 1
             continue
@@ -942,8 +943,8 @@ def handle_telegram_commands(conn: sqlite3.Connection) -> None:
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-            params={"offset": last_id + 1, "timeout": 5, "allowed_updates": '["message"]'},
-            timeout=15,
+            params={"offset": last_id + 1, "timeout": 0, "allowed_updates": '["message"]'},
+            timeout=10,
         )
         if not r.ok:
             return
