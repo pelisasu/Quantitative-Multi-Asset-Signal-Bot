@@ -18,7 +18,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -57,20 +57,16 @@ ACCOUNT_CONFIG: Dict[str, Any] = {
 }
 
 TIMING_CONFIG: Dict[str, Any] = {
-    # Cooldown sinyal arah sama (menit) agar tidak spam tapi tetap meloloskan setup baru yang sah
     "cooldown_minutes": {
         "SCALPING": 30,
         "SWING": 180,
     },
-    # Anti flip-flop (ping-pong BUY <-> SELL) terlalu cepat (menit)
     "flip_flop_lockout_minutes": {
         "SCALPING": 60,
         "SWING": 360,
     },
-    # Override flip-flop sebelum lockout habis HANYA jika ada CHoCH/BOS & skor melampaui threshold ketat
     "flip_flop_override_score_delta": 12.0,
     "flip_flop_override_min_score": 80.0,
-    # Refresh parameter grid-search & grafik backtest
     "optimize_refresh_hours": 168,
     "backtest_refresh_hours": 6,
 }
@@ -78,11 +74,10 @@ TIMING_CONFIG: Dict[str, Any] = {
 # Konfigurasi per instrumen:
 # - multiplier & offset: kalibrasi akhir ke harga simbol MT5 broker Anda:
 #   harga_final = (harga_sumber * multiplier) + offset
-# - Khusus NAS100: jika ^NDX gagal dan failover ke QQQ, qqq_to_ndx_multiplier & qqq_to_ndx_offset
+# - NAS100: jika ^NDX gagal dan failover ke QQQ, qqq_to_ndx_multiplier & qqq_to_ndx_offset
 #   diterapkan lebih dulu sebelum multiplier & offset broker.
 # - contract_size: nilai per 1.00 lot standar untuk pergerakan 1.0 unit harga
-#   (XAUUSD = 100 oz -> $1 move = $100/lot; NAS100 CFD umum = 1 kontrak -> 1 pt = $1/lot;
-#    ubah ke 10.0/20.0 jika broker Anda memakai kontrak indeks berbeda)
+#   (XAUUSD = 100 oz -> $1 move = $100/lot; NAS100 CFD umum = 1 kontrak -> 1 pt = $1/lot).
 INSTRUMENT_CONFIG: Dict[str, Dict[str, Any]] = {
     "XAUUSD": {
         "display_name": "XAUUSD",
@@ -100,29 +95,30 @@ INSTRUMENT_CONFIG: Dict[str, Dict[str, Any]] = {
         "scalp_session_utc": (7, 20),      # Sesi London + NY
         "rollover_avoid_utc": (21, 23),    # Hindari spread rollover harian
         "sources": [
+            # Cek spot XAUUSD=X sekali (circuit-breaker otomatis jika 404/delisted di Yahoo),
+            # lalu langsung failover ke feed Spot Gold 1 oz tanpa rate-limit (Kraken/Coinbase)
             {"provider": "yfinance", "symbol": "XAUUSD=X", "src_mult": 1.0, "src_offset": 0.0},
-            {"provider": "yahoo_v8", "symbol": "XAUUSD=X", "src_mult": 1.0, "src_offset": 0.0},
-            {"provider": "yfinance", "symbol": "XAU=X", "src_mult": 1.0, "src_offset": 0.0},
-            {"provider": "yahoo_v8", "symbol": "XAU=X", "src_mult": 1.0, "src_offset": 0.0},
+            {"provider": "kraken", "symbol": "PAXGUSD", "src_mult": 1.0, "src_offset": 0.0},
             {"provider": "coinbase", "symbol": "PAXG-USD", "src_mult": 1.0, "src_offset": 0.0},
+            {"provider": "yfinance", "symbol": "GC=F", "src_mult": 1.0, "src_offset": 0.0},
         ],
     },
     "NAS100": {
         "display_name": "NAS100",
         "asset_class": "INDEX",
         "price_decimals": 2,
-        "multiplier": 1.0,          # Kalibrasi multiplier broker (default 1.0)
-        "offset": 0.0,              # Kalibrasi offset poin CFD vs ^NDX (misal +15.0)
+        "multiplier": 1.0,
+        "offset": 0.0,
         "qqq_to_ndx_multiplier": 41.15,
         "qqq_to_ndx_offset": 0.0,
-        "contract_size": 1.0,       # 1.0 untuk CFD standar ($1/poin per 1.00 lot)
+        "contract_size": 1.0,
         "spread_points": 1.80,
         "slippage_points": 0.80,
         "min_sl_distance": 12.0,
         "max_entry_slip_atr": {"SCALPING": 0.35, "SWING": 0.45},
         "max_bar_spike_pct": 0.045,
         "is_24_7": False,
-        "scalp_session_utc": (13, 21),     # Sesi NY aktif
+        "scalp_session_utc": (13, 21),
         "rollover_avoid_utc": (21, 23),
         "sources": [
             {"provider": "yfinance", "symbol": "^NDX", "src_mult": 1.0, "src_offset": 0.0},
@@ -259,6 +255,13 @@ logging.basicConfig(
 logging.Formatter.converter = time.gmtime
 logger = logging.getLogger("QuantSignalBot")
 
+# Redam log internal yfinance yang terlalu berisik saat probe failover wajar
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+# Circuit-breaker per run untuk sumber yang terbukti 404/delisted/rate-limited
+DEAD_SOURCES_CACHE: Set[Tuple[str, str]] = set()
+YAHOO_V8_RATE_LIMITED: bool = False
+
 
 # ==============================================================================
 # 2. DATA STRUCTURES
@@ -359,14 +362,18 @@ def request_with_backoff(
     for attempt in range(max_retries):
         try:
             resp = HTTP_SESSION.request(method=method, url=url, timeout=timeout, **kwargs)
+            if resp.status_code == 404:
+                resp.raise_for_status()
             if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt == max_retries - 1:
+                    resp.raise_for_status()
                 retry_after = resp.headers.get("Retry-After")
                 wait_sec = (
                     float(retry_after)
                     if retry_after and retry_after.replace(".", "", 1).isdigit()
                     else base_delay * (2 ** attempt)
                 )
-                wait_sec = min(wait_sec, 20.0)
+                wait_sec = min(wait_sec, 15.0)
                 logger.warning(
                     "HTTP %s dari %s (percobaan %d/%d). Tunggu %.1fs",
                     resp.status_code,
@@ -376,14 +383,16 @@ def request_with_backoff(
                     wait_sec,
                 )
                 time.sleep(wait_sec)
-                last_exc = requests.HTTPError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                last_exc = requests.HTTPError(f"HTTP {resp.status_code}: {resp.text[:160]}")
                 continue
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
             last_exc = exc
+            if getattr(getattr(exc, "response", None), "status_code", None) == 404:
+                break
             if attempt < max_retries - 1:
-                wait_sec = min(base_delay * (2 ** attempt), 15.0)
+                wait_sec = min(base_delay * (2 ** attempt), 12.0)
                 time.sleep(wait_sec)
     raise RuntimeError(f"Request gagal ke {url.split('?')[0]}: {last_exc}")
 
@@ -668,9 +677,6 @@ def forensic_audit_log(
     stale_seconds: float,
     extra_details: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """
-    Mencatat jejak audit forensik lengkap untuk setiap evaluasi instrumen & mode.
-    """
     details = {
         "entry": decision.entry,
         "sl": decision.sl,
@@ -814,6 +820,10 @@ def _fetch_yfinance(ticker: str, interval: str) -> pd.DataFrame:
 
 
 def _fetch_yahoo_v8(ticker: str, interval: str) -> pd.DataFrame:
+    global YAHOO_V8_RATE_LIMITED
+    if YAHOO_V8_RATE_LIMITED:
+        raise RuntimeError("Yahoo v8 rate-limited pada run ini")
+
     fetch_iv = "1h" if interval == "4h" else interval
     range_str = YF_PERIOD_BY_TF.get(fetch_iv, "60d")
     encoded = requests.utils.quote(ticker, safe="")
@@ -825,7 +835,7 @@ def _fetch_yahoo_v8(ticker: str, interval: str) -> pd.DataFrame:
     last_err: Optional[Exception] = None
     for url in urls:
         try:
-            resp = request_with_backoff("GET", url, params=params, max_retries=2, timeout=15)
+            resp = request_with_backoff("GET", url, params=params, max_retries=1, timeout=12)
             payload = resp.json()
             result = payload.get("chart", {}).get("result")
             if not result:
@@ -848,6 +858,9 @@ def _fetch_yahoo_v8(ticker: str, interval: str) -> pd.DataFrame:
             return _flatten_ohlcv_columns(df)
         except Exception as exc:
             last_err = exc
+            if "429" in str(exc):
+                YAHOO_V8_RATE_LIMITED = True
+                break
     if last_err:
         raise last_err
     return pd.DataFrame()
@@ -1063,10 +1076,16 @@ def fetch_instrument_tf(
     for src in cfg["sources"]:
         provider = src["provider"]
         ticker = src["symbol"]
+        if (provider, ticker) in DEAD_SOURCES_CACHE:
+            continue
         try:
             if provider == "yfinance":
                 raw = _fetch_yfinance(ticker, interval)
-                if interval == "4h" and not raw.empty:
+                if raw.empty:
+                    # Circuit-break ticker Yahoo yang delisted/kosong agar TF lain langsung failover
+                    DEAD_SOURCES_CACHE.add((provider, ticker))
+                    DEAD_SOURCES_CACHE.add(("yahoo_v8", ticker))
+                elif interval == "4h":
                     raw = _resample_4h(raw)
             elif provider == "yahoo_v8":
                 raw = _fetch_yahoo_v8(ticker, interval)
@@ -1089,6 +1108,8 @@ def fetch_instrument_tf(
                 return df_adj, live_adj, stale_s, m_open, f"{provider}:{ticker}"
             errors.append(f"{provider}:{ticker}->{status}")
         except Exception as exc:
+            if "404" in str(exc) or "delisted" in str(exc).lower():
+                DEAD_SOURCES_CACHE.add((provider, ticker))
             errors.append(f"{provider}:{ticker}->ERR({str(exc)[:60]})")
 
     raise RuntimeError(f"Semua sumber gagal untuk {symbol} {interval}: {' | '.join(errors)}")
@@ -1235,11 +1256,6 @@ def detect_market_structure(df: pd.DataFrame, swing_len: int = 3) -> StructureSt
 def detect_wick_fakeout(
     df: pd.DataFrame, structure: StructureState, atr: float
 ) -> WickFakeoutState:
-    """
-    Penyaring Wick / Fakeout non-menghambat:
-    Memberi bonus konfluensi jika ada liquidity sweep searah,
-    atau penalti anti-jebakan jika arah sinyal melawan sweep terbaru.
-    """
     if len(df) < 25 or atr <= EPS:
         return WickFakeoutState("NONE", 0.0, "NO_SWEEP")
 
@@ -1272,6 +1288,8 @@ def classify_regime(
     mcfg = MODE_CONFIG[mode]
     if atr_ratio > mcfg["max_atr_ratio"]:
         return "VOL_SPIKE", False, f"ATR_RATIO_EXTREME({atr_ratio:.2f}>{mcfg['max_atr_ratio']:.2f})"
+    if er < 0.12:
+        return "CHOPPY", False, f"EXTREME_CHOP_SIDEWAYS(ER={er:.2f},ADX={adx:.1f})"
     if adx < mcfg["min_adx"] and er < mcfg["min_er"]:
         return "CHOPPY", False, f"CHOPPY_MARKET(ADX={adx:.1f},ER={er:.2f})"
     if adx >= 25.0 and er >= 0.35:
@@ -1720,7 +1738,6 @@ def evaluate_signal(
 def _align_higher_tf(
     df_ltf: pd.DataFrame, df_htf: pd.DataFrame, htf_interval: str
 ) -> pd.DataFrame:
-    """Strictly causal backward merge_asof berbasis waktu tutup candle HTF (nol lookahead)."""
     ltf_idx = pd.DataFrame({"ts": df_ltf.index}).sort_values("ts")
     htf_reset = df_htf.copy()
     htf_reset.index.name = "ts"
@@ -2352,6 +2369,22 @@ def run_bot(cli_args: argparse.Namespace) -> None:
 
                     for tf in (ltf_name, mtf_name, htf_name):
                         if (symbol, tf) not in tf_cache:
+                            # Hemat request API: bangun 4h dari cache 1h bila sudah tersedia
+                            if tf == "4h" and (symbol, "1h") in tf_cache:
+                                df1h, live1h, _, open1h, src1h = tf_cache[(symbol, "1h")]
+                                df4h_raw = _resample_4h(df1h)
+                                df4h_clean, live4h, stale4h, _, status4h = clean_and_validate_ohlcv(
+                                    df4h_raw, symbol=symbol, interval="4h", now_utc=now_utc
+                                )
+                                if status4h == "OK" and not df4h_clean.empty:
+                                    tf_cache[(symbol, "4h")] = (
+                                        df4h_clean,
+                                        live1h if live1h > 0 else live4h,
+                                        stale4h,
+                                        open1h,
+                                        src1h,
+                                    )
+                                    continue
                             tf_cache[(symbol, tf)] = fetch_instrument_tf(symbol, tf, now_utc=now_utc)
 
                     df_ltf_raw, live_p, stale_s, m_open, src_ltf = tf_cache[(symbol, ltf_name)]
