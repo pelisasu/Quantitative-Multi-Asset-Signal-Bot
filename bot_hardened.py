@@ -647,6 +647,12 @@ def evaluate_signal(instrument: str, mode: str,
 # ==============================================================================
 # HONEST NON-OVERLAPPING MTF BACKTESTER (TP1->BE TRAIL + GAP-THROUGH SL)
 # ==============================================================================
+def _to_epoch_sec(idx: pd.DatetimeIndex) -> np.ndarray:
+    """Resolution-independent UTC epoch seconds (safe on pandas 1.x/2.x/3.x [s]/[us]/[ns])."""
+    base = pd.Timestamp("1970-01-01", tz="UTC")
+    utc_idx = idx.tz_localize("UTC") if idx.tzinfo is None else idx.tz_convert("UTC")
+    return ((utc_idx - base) / pd.Timedelta(seconds=1)).to_numpy(dtype=float)
+
 def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mode: str,
                  sl_mult: float, tp_target_mult: float, threshold: int,
                  min_trades: Optional[int] = None,
@@ -664,14 +670,14 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
         df_ent = compute_indicators(df_ent)
         htf_sh, htf_sl = extract_causal_swings(df_htf, lookback=5)
 
-    htf_close_ts = (df_htf.index + pd.Timedelta(seconds=tf["htf_sec"])).asi8
-    ent_close_ts = (df_ent.index + pd.Timedelta(seconds=tf["entry_sec"])).asi8
-    ent_open_ts  = df_ent.index.asi8
+    htf_close_ts = _to_epoch_sec(df_htf.index) + tf["htf_sec"]
+    ent_open_ts  = _to_epoch_sec(df_ent.index)
+    ent_close_ts = ent_open_ts + tf["entry_sec"]
 
     equity = peak = 10000.0
     curve, trades = [equity], []
     htf_ptr = 0
-    last_exit_ts = 0
+    last_exit_ts = 0.0
     last_dir: Optional[str] = None
     i = 60
     n_ent = len(df_ent)
@@ -693,7 +699,7 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
 
         if last_dir is not None:
             cd_min = GLOBAL["cooldown_same_min"] if last_dir == direction else GLOBAL["cooldown_flip_min"]
-            if (ent_open_ts[i] - last_exit_ts) / 6e10 < cd_min:
+            if (ent_open_ts[i] - last_exit_ts) / 60.0 < cd_min:
                 i += 1
                 continue
 
@@ -753,16 +759,16 @@ def backtest_mtf(df_htf: pd.DataFrame, df_ent: pd.DataFrame, instrument: str, mo
         last_dir = direction
         i = exit_j + 1  # Non-overlapping!
 
-    req_trades = int(min_trades if min_trades is not None else GLOBAL["bt_min_trades"])
-    if len(trades) < req_trades:
-        return {"score": -1e9, "trades": len(trades), "winrate": 0.0, "profit_factor": 0.0,
-                "max_dd": 0.0, "equity_curve": curve}
-
     wins = sum(1 for t in trades if t["pnl"] > 0)
-    wr   = wins / len(trades)
+    wr   = (wins / len(trades)) if trades else 0.0
     gw   = sum(t["pnl"] for t in trades if t["pnl"] > 0)
     gl   = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
-    pf   = gw / (gl + 1e-8)
+    pf   = (gw / (gl + 1e-8)) if trades else 0.0
+
+    req_trades = int(min_trades if min_trades is not None else GLOBAL["bt_min_trades"])
+    if len(trades) < req_trades:
+        return {"score": -1e9, "trades": len(trades), "winrate": wr, "profit_factor": pf,
+                "max_dd": 0.0, "equity_curve": curve}
     pk, mdd = curve[0], 0.0
     for v in curve:
         pk = max(pk, v)
@@ -849,8 +855,8 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
         if df_ent is None or df_ent.empty:
             continue
         bar_sec = TIMEFRAMES[mode]["entry_sec"]
-        opened_dt = pd.Timestamp(_parse_ts(opened_ts))
-        fresh = df_ent[(df_ent.index + pd.Timedelta(seconds=bar_sec)) > opened_dt]
+        opened_sec = _parse_ts(opened_ts).timestamp()
+        fresh = df_ent[(_to_epoch_sec(df_ent.index) + bar_sec) > opened_sec]
         if fresh.empty:
             continue
         risk_dist = max(abs(entry - sl), 1e-9)
