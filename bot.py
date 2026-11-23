@@ -8,10 +8,12 @@ Output      : Telegram (+ /check command), Optional Discord Webhook, backtest_pe
 """
 
 import argparse
+import html
 import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -71,13 +73,6 @@ TIMING_CONFIG: Dict[str, Any] = {
     "backtest_refresh_hours": 6,
 }
 
-# Konfigurasi per instrumen:
-# - multiplier & offset: kalibrasi akhir ke harga simbol MT5 broker Anda:
-#   harga_final = (harga_sumber * multiplier) + offset
-# - NAS100: jika ^NDX gagal dan failover ke QQQ, qqq_to_ndx_multiplier & qqq_to_ndx_offset
-#   diterapkan lebih dulu sebelum multiplier & offset broker.
-# - contract_size: nilai per 1.00 lot standar untuk pergerakan 1.0 unit harga
-#   (XAUUSD = 100 oz -> $1 move = $100/lot; NAS100 CFD umum = 1 kontrak -> 1 pt = $1/lot).
 INSTRUMENT_CONFIG: Dict[str, Dict[str, Any]] = {
     "XAUUSD": {
         "display_name": "XAUUSD",
@@ -92,11 +87,9 @@ INSTRUMENT_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_entry_slip_atr": {"SCALPING": 0.35, "SWING": 0.45},
         "max_bar_spike_pct": 0.04,
         "is_24_7": False,
-        "scalp_session_utc": (7, 20),      # Sesi London + NY
-        "rollover_avoid_utc": (21, 23),    # Hindari spread rollover harian
+        "scalp_session_utc": (7, 20),
+        "rollover_avoid_utc": (21, 23),
         "sources": [
-            # Cek spot XAUUSD=X sekali (circuit-breaker otomatis jika 404/delisted di Yahoo),
-            # lalu langsung failover ke feed Spot Gold 1 oz tanpa rate-limit (Kraken/Coinbase)
             {"provider": "yfinance", "symbol": "XAUUSD=X", "src_mult": 1.0, "src_offset": 0.0},
             {"provider": "kraken", "symbol": "PAXGUSD", "src_mult": 1.0, "src_offset": 0.0},
             {"provider": "coinbase", "symbol": "PAXG-USD", "src_mult": 1.0, "src_offset": 0.0},
@@ -255,12 +248,24 @@ logging.basicConfig(
 logging.Formatter.converter = time.gmtime
 logger = logging.getLogger("QuantSignalBot")
 
-# Redam log internal yfinance yang terlalu berisik saat probe failover wajar
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-# Circuit-breaker per run untuk sumber yang terbukti 404/delisted/rate-limited
 DEAD_SOURCES_CACHE: Set[Tuple[str, str]] = set()
 YAHOO_V8_RATE_LIMITED: bool = False
+
+
+def sanitize_secrets(text: str) -> str:
+    """Samarkan token Telegram atau webhook sensitif sebelum logging/alerting."""
+    cleaned = re.sub(r"/bot[0-9A-Za-z:_-]+/", "/bot***/", str(text))
+    if TELEGRAM_BOT_TOKEN:
+        cleaned = cleaned.replace(TELEGRAM_BOT_TOKEN, "***")
+    if DISCORD_WEBHOOK_URL:
+        cleaned = cleaned.replace(DISCORD_WEBHOOK_URL, "***DISCORD_WEBHOOK***")
+    return cleaned
+
+
+def esc_html(text: Any) -> str:
+    return html.escape(str(text), quote=False)
 
 
 # ==============================================================================
@@ -358,15 +363,18 @@ def request_with_backoff(
     timeout: int = 15,
     **kwargs: Any,
 ) -> requests.Response:
-    last_exc: Optional[Exception] = None
+    last_err_msg: str = ""
+    safe_url = sanitize_secrets(url.split("?")[0])
     for attempt in range(max_retries):
         try:
             resp = HTTP_SESSION.request(method=method, url=url, timeout=timeout, **kwargs)
-            if resp.status_code == 404:
-                resp.raise_for_status()
+            if resp.status_code in (400, 401, 403, 404):
+                body_preview = sanitize_secrets(resp.text[:250])
+                raise RuntimeError(f"HTTP {resp.status_code} ({safe_url}): {body_preview}")
             if resp.status_code in (429, 500, 502, 503, 504):
                 if attempt == max_retries - 1:
-                    resp.raise_for_status()
+                    body_preview = sanitize_secrets(resp.text[:250])
+                    raise RuntimeError(f"HTTP {resp.status_code} ({safe_url}): {body_preview}")
                 retry_after = resp.headers.get("Retry-After")
                 wait_sec = (
                     float(retry_after)
@@ -377,24 +385,24 @@ def request_with_backoff(
                 logger.warning(
                     "HTTP %s dari %s (percobaan %d/%d). Tunggu %.1fs",
                     resp.status_code,
-                    url.split("?")[0],
+                    safe_url,
                     attempt + 1,
                     max_retries,
                     wait_sec,
                 )
                 time.sleep(wait_sec)
-                last_exc = requests.HTTPError(f"HTTP {resp.status_code}: {resp.text[:160]}")
+                last_err_msg = f"HTTP {resp.status_code}: {sanitize_secrets(resp.text[:160])}"
                 continue
             resp.raise_for_status()
             return resp
+        except RuntimeError:
+            raise
         except requests.RequestException as exc:
-            last_exc = exc
-            if getattr(getattr(exc, "response", None), "status_code", None) == 404:
-                break
+            last_err_msg = sanitize_secrets(str(exc))
             if attempt < max_retries - 1:
                 wait_sec = min(base_delay * (2 ** attempt), 12.0)
                 time.sleep(wait_sec)
-    raise RuntimeError(f"Request gagal ke {url.split('?')[0]}: {last_exc}")
+    raise RuntimeError(f"Request gagal ke {safe_url}: {last_err_msg}")
 
 
 # ==============================================================================
@@ -1082,7 +1090,6 @@ def fetch_instrument_tf(
             if provider == "yfinance":
                 raw = _fetch_yfinance(ticker, interval)
                 if raw.empty:
-                    # Circuit-break ticker Yahoo yang delisted/kosong agar TF lain langsung failover
                     DEAD_SOURCES_CACHE.add((provider, ticker))
                     DEAD_SOURCES_CACHE.add(("yahoo_v8", ticker))
                 elif interval == "4h":
@@ -2176,7 +2183,7 @@ def format_telegram_signal(dec: SignalDecision) -> str:
     mode_lbl = MODE_CONFIG[dec.mode]["short_label"]
     hhmm = datetime.now(timezone.utc).strftime("%H:%M UTC")
     return (
-        f"⚡ <b>{dec.symbol} | {mode_lbl} | {dec.verdict}</b>\n"
+        f"⚡ <b>{esc_html(dec.symbol)} | {esc_html(mode_lbl)} | {esc_html(dec.verdict)}</b>\n"
         f"🎯 Entry: <code>{format_price(dec.entry, dec.symbol)}</code> | "
         f"🛑 SL: <code>{format_price(dec.sl, dec.symbol)}</code>\n"
         f"✅ TP1: <code>{format_price(dec.tp1, dec.symbol)}</code> | "
@@ -2184,7 +2191,7 @@ def format_telegram_signal(dec: SignalDecision) -> str:
         f"TP3: <code>{format_price(dec.tp3, dec.symbol)}</code>\n"
         f"📐 Lot: <code>{dec.lot_size:.2f}</code> | "
         f"Skor: <code>{dec.score:.0f}/100</code> | "
-        f"Regime: <code>{dec.regime}</code>\n"
+        f"Regime: <code>{esc_html(dec.regime)}</code>\n"
         f"🔄 Trail: Aktif @ TP1 (BE) | 🕒 <code>{hhmm}</code>\n"
         f"📊 Zone: <code>{format_price(dec.entry_zone_min, dec.symbol)}-"
         f"{format_price(dec.entry_zone_max, dec.symbol)}</code> | "
@@ -2192,19 +2199,37 @@ def format_telegram_signal(dec: SignalDecision) -> str:
     )
 
 
-def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
+def send_telegram_message(text: str, parse_mode: Optional[str] = "HTML") -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum diset. Pesan hanya di-log.")
         return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+    msg_trimmed = text[:4000]
+    payload: Dict[str, Any] = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
+        "text": msg_trimmed,
         "disable_web_page_preview": True,
     }
-    request_with_backoff("POST", url, json=payload, max_retries=4, timeout=15)
-    return True
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    try:
+        request_with_backoff("POST", url, json=payload, max_retries=4, timeout=15)
+        return True
+    except RuntimeError as exc:
+        if parse_mode and "HTTP 400" in str(exc):
+            logger.warning("Telegram HTML 400 fallback ke plain text: %s", exc)
+            plain_text = re.sub(r"</?(?:b|i|code|pre|a|u|s)[^>]*>", "", msg_trimmed)
+            plain_text = html.unescape(plain_text)[:4000]
+            fallback_payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": plain_text,
+                "disable_web_page_preview": True,
+            }
+            request_with_backoff("POST", url, json=fallback_payload, max_retries=3, timeout=15)
+            return True
+        raise
 
 
 def send_discord_signal(dec: SignalDecision) -> None:
@@ -2244,7 +2269,7 @@ def send_discord_signal(dec: SignalDecision) -> None:
     try:
         request_with_backoff("POST", DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, max_retries=3, timeout=12)
     except Exception as exc:
-        logger.warning("Gagal kirim Discord webhook: %s", exc)
+        logger.warning("Gagal kirim Discord webhook: %s", sanitize_secrets(str(exc)))
 
 
 def poll_telegram_check_requests(db: SignalDatabase) -> bool:
@@ -2260,7 +2285,7 @@ def poll_telegram_check_requests(db: SignalDatabase) -> bool:
         resp = request_with_backoff("GET", url, params=params, max_retries=3, timeout=12)
         data = resp.json()
     except Exception as exc:
-        logger.warning("Gagal polling Telegram getUpdates: %s", exc)
+        logger.warning("Gagal polling Telegram getUpdates: %s", sanitize_secrets(str(exc)))
         return False
 
     if not data.get("ok"):
@@ -2301,12 +2326,14 @@ def build_check_summary_message(
 
     for sym in ("XAUUSD", "NAS100", "BTCUSD", "ETHUSD"):
         if sym in errors_by_sym:
-            lines.append(f"\n⚠️ <b>{sym}</b>: <code>DATA_ERR ({errors_by_sym[sym][:45]})</code>")
+            lines.append(
+                f"\n⚠️ <b>{esc_html(sym)}</b>: <code>DATA_ERR ({esc_html(errors_by_sym[sym][:45])})</code>"
+            )
             continue
         modes_dict = decisions_by_sym.get(sym, {})
         sample_dec = next(iter(modes_dict.values()), None)
         price_str = format_price(sample_dec.live_price, sym) if sample_dec else "-"
-        lines.append(f"\n<b>{sym}</b> (<code>{price_str}</code>)")
+        lines.append(f"\n<b>{esc_html(sym)}</b> (<code>{esc_html(price_str)}</code>)")
         for mode in ("SCALPING", "SWING"):
             if mode not in modes_dict:
                 continue
@@ -2318,12 +2345,13 @@ def build_check_summary_message(
                 if cd_note and cd_note != "SENT":
                     tag += f" [{cd_note}]"
                 lines.append(
-                    f"• {ml}: <b>{tag}</b> | E:<code>{format_price(d.entry, sym)}</code> "
+                    f"• {esc_html(ml)}: <b>{esc_html(tag)}</b> | E:<code>{format_price(d.entry, sym)}</code> "
                     f"SL:<code>{format_price(d.sl, sym)}</code> TP1:<code>{format_price(d.tp1, sym)}</code>"
                 )
             else:
                 lines.append(
-                    f"• {ml}: <code>NO_SIGNAL</code> | {d.regime} | <i>{d.reason[:36]}</i>"
+                    f"• {esc_html(ml)}: <code>NO_SIGNAL</code> | {esc_html(d.regime)} | "
+                    f"<i>{esc_html(d.reason[:42])}</i>"
                 )
 
     return "\n".join(lines)
@@ -2369,7 +2397,6 @@ def run_bot(cli_args: argparse.Namespace) -> None:
 
                     for tf in (ltf_name, mtf_name, htf_name):
                         if (symbol, tf) not in tf_cache:
-                            # Hemat request API: bangun 4h dari cache 1h bila sudah tersedia
                             if tf == "4h" and (symbol, "1h") in tf_cache:
                                 df1h, live1h, _, open1h, src1h = tf_cache[(symbol, "1h")]
                                 df4h_raw = _resample_4h(df1h)
@@ -2457,7 +2484,7 @@ def run_bot(cli_args: argparse.Namespace) -> None:
                     )
             except Exception as sym_exc:
                 logger.exception("Error memproses instrumen %s: %s", symbol, sym_exc)
-                errors_by_sym[symbol] = str(sym_exc)
+                errors_by_sym[symbol] = sanitize_secrets(str(sym_exc))
 
         if need_chart_refresh and backtest_results:
             generate_backtest_chart(backtest_results, CHART_PATH)
@@ -2485,17 +2512,18 @@ def main() -> None:
     try:
         run_bot(args)
     except Exception as exc:
-        err_trace = traceback.format_exc()
-        logger.critical("Fatal error pada bot: %s\n%s", exc, err_trace)
+        safe_exc = sanitize_secrets(str(exc))
+        err_trace = sanitize_secrets(traceback.format_exc())
+        logger.critical("Fatal error pada bot: %s\n%s", safe_exc, err_trace)
         err_msg = (
             f"🚨 <b>BOT ERROR ALERT</b>\n"
             f"🕒 <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
-            f"❌ <code>{str(exc)[:300]}</code>"
+            f"❌ <code>{esc_html(safe_exc[:300])}</code>"
         )
         try:
             send_telegram_message(err_msg)
         except Exception as tg_exc:
-            logger.error("Gagal mengirim alert error ke Telegram: %s", tg_exc)
+            logger.error("Gagal mengirim alert error ke Telegram: %s", sanitize_secrets(str(tg_exc)))
         sys.exit(1)
 
 
