@@ -1,4 +1,4 @@
-# bot.py
+# bot.py  (fixed: yf-silenced, market_open gate, realistic backtest)
 """
 ==============================================================================
 AUTO TRADING SIGNAL BOT
@@ -12,12 +12,11 @@ Notify      : Telegram (HTML), Discord (optional)
 import os
 import sys
 import time
-import json
 import math
 import sqlite3
 import logging
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
@@ -38,29 +37,34 @@ import matplotlib.pyplot as plt
 # ==============================================================================
 # CENTRAL CONFIG
 # ==============================================================================
-DB_PATH     = "trading_signals.db"
-CHART_PATH  = "backtest_performance.png"
+DB_PATH    = "trading_signals.db"
+CHART_PATH = "backtest_performance.png"
 
-TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-DISCORD_WEBHOOK_URL  = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 ACCOUNT = {
-    "balance":         10000.0,
-    "risk_pct_scalp":  0.50,
-    "risk_pct_swing":  0.75,
+    "balance":        10000.0,
+    "risk_pct_scalp": 0.50,
+    "risk_pct_swing": 0.75,
 }
 
 GLOBAL = {
-    "min_score_signal":      65,
-    "max_entry_chase_atr":   0.85,
-    "cooldown_same_min":     60,
-    "cooldown_flip_min":     120,
-    "stale_max_min":         {"1m": 15, "5m": 30, "15m": 60, "1h": 180, "4h": 480},
-    "spike_z_threshold":     6.0,
-    "no_signal_if_choppy":   True,
+    "min_score_signal":    65,
+    "max_entry_chase_atr": 0.85,
+    "cooldown_same_min":   60,
+    "cooldown_flip_min":   120,
+    "stale_max_min":       {"1m": 15, "5m": 30, "15m": 60, "1h": 180, "4h": 480},
+    "weekend_stale_extend_min": 3 * 24 * 60,   # 72h extra for exchange-closed assets
+    "spike_z_threshold":   6.0,
+    "no_signal_if_choppy": True,
     "spread_pts":   {"XAUUSD": 0.30, "NAS100": 1.5, "BTCUSD": 15.0, "ETHUSD": 1.0},
     "slippage_pts": {"XAUUSD": 0.10, "NAS100": 0.5, "BTCUSD":  5.0, "ETHUSD": 0.3},
+    "bt_risk_pct":        0.005,   # 0.5% risk per trade in backtest
+    "bt_min_equity":      1000.0,
+    "bt_max_dd_stop":     0.30,
+    "bt_min_trades":      20,
 }
 
 INSTRUMENTS: Dict[str, Dict[str, Any]] = {
@@ -73,7 +77,8 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
         "contract": {"pip_value_per_lot": 100.0, "min_lot": 0.01, "max_lot": 5.0,
                      "lot_step": 0.01, "pip_size": 0.01},
         "session_filter": True,
-        "session_hours": [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+        "session_hours":  list(range(7, 21)),
+        "kind": "commodity",
     },
     "NAS100": {
         "sources": [
@@ -84,7 +89,8 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
         "contract": {"pip_value_per_lot": 1.0, "min_lot": 0.01, "max_lot": 10.0,
                      "lot_step": 0.01, "pip_size": 1.0},
         "session_filter": True,
-        "session_hours": [13, 14, 15, 16, 17, 18, 19, 20],
+        "session_hours":  list(range(13, 21)),
+        "kind": "index",
     },
     "BTCUSD": {
         "sources": [
@@ -95,6 +101,7 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
         "contract": {"pip_value_per_lot": 1.0, "min_lot": 0.01, "max_lot": 5.0,
                      "lot_step": 0.01, "pip_size": 1.0},
         "session_filter": False, "session_hours": list(range(24)),
+        "kind": "crypto",
     },
     "ETHUSD": {
         "sources": [
@@ -105,6 +112,7 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
         "contract": {"pip_value_per_lot": 1.0, "min_lot": 0.01, "max_lot": 20.0,
                      "lot_step": 0.01, "pip_size": 0.01},
         "session_filter": False, "session_hours": list(range(24)),
+        "kind": "crypto",
     },
 }
 
@@ -128,6 +136,10 @@ def setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         stream=sys.stdout,
     )
+    # silence noisy third-party loggers (yfinance emits 404 as ERROR)
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("peewee").setLevel(logging.WARNING)
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -141,6 +153,41 @@ def _parse_ts(ts: str) -> datetime:
     except Exception:
         return now_utc()
 
+def is_weekend_zone(dt: datetime) -> bool:
+    """Fri 21:00 UTC – Mon 01:00 UTC: exchange-listed venues are closed."""
+    wd, hour = dt.weekday(), dt.hour
+    if wd == 4 and hour >= 21:  # Friday after US cash/fut close
+        return True
+    if wd in (5, 6):            # Saturday / Sunday
+        return True
+    if wd == 0 and hour < 1:    # Monday pre-open
+        return True
+    return False
+
+def market_open(inst: str) -> bool:
+    """Return False for exchange-listed instruments outside cash/session hours."""
+    kind = INSTRUMENTS[inst]["kind"]
+    if kind == "crypto":
+        return True
+    now = now_utc()
+    wd, hour = now.weekday(), now.hour
+
+    if kind == "index":
+        # NAS100 cash session approx 13:30–20:00 UTC, Mon–Fri
+        return (wd < 5) and (13 <= hour < 20)
+
+    if kind == "commodity":
+        # XAUUSD spot ~ Sun 22:00 UTC open – Fri 21:00 UTC close
+        if wd == 5:                       # Saturday
+            return False
+        if wd == 4 and hour >= 21:        # Friday after close
+            return False
+        if wd == 6 and hour < 22:         # Sunday before open
+            return False
+        return True
+
+    return True
+
 # ==============================================================================
 # DATA FETCHERS
 # ==============================================================================
@@ -153,7 +200,7 @@ def fetch_yf(symbol: str, interval: str, period: str, min_bars: int) -> Optional
     if not HAS_YF:
         return None
     try:
-        t = yf.Ticker(symbol)
+        t  = yf.Ticker(symbol)
         df = t.history(period=period, interval=interval, auto_adjust=False)
         if df is None or df.empty:
             return None
@@ -163,16 +210,15 @@ def fetch_yf(symbol: str, interval: str, period: str, min_bars: int) -> Optional
         if "Volume" not in df.columns:
             df["Volume"] = 0.0
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        if len(df) < min_bars:
-            return None
-        return df
-    except Exception as e:
-        logging.warning(f"[yf] {symbol} {interval} failed: {e}")
+        return df if len(df) >= min_bars else None
+    except Exception:
+        # swallow — yfinance itself already logs; we already silenced its logger
         return None
 
 def fetch_coinbase(product: str, granularity: int) -> Optional[pd.DataFrame]:
     try:
-        url = f"https://api.exchange.coinbase.com/products/{product}/candles?granularity={granularity}"
+        url = (f"https://api.exchange.coinbase.com/products/{product}"
+               f"/candles?granularity={granularity}")
         r = requests.get(url, timeout=20, headers={"User-Agent": "signal-bot/1.0"})
         r.raise_for_status()
         data = r.json()
@@ -186,10 +232,11 @@ def fetch_coinbase(product: str, granularity: int) -> Optional[pd.DataFrame]:
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         return df if len(df) > 50 else None
     except Exception as e:
-        logging.warning(f"[coinbase] {product} {granularity} failed: {e}")
+        logging.debug(f"[coinbase] {product} {granularity} failed: {e}")
         return None
 
-def sanitize_df(df: pd.DataFrame, interval: str, min_bars: int) -> Optional[pd.DataFrame]:
+def sanitize_df(df: pd.DataFrame, interval: str, min_bars: int,
+                instrument: str) -> Optional[pd.DataFrame]:
     if df is None or df.empty:
         return None
     last_ts = df.index[-1]
@@ -200,16 +247,24 @@ def sanitize_df(df: pd.DataFrame, interval: str, min_bars: int) -> Optional[pd.D
             return None
     if last_ts.tzinfo is None:
         last_ts = last_ts.tz_localize("UTC")
+
     age_min = (pd.Timestamp.now(tz="UTC") - last_ts).total_seconds() / 60.0
-    limit = GLOBAL["stale_max_min"].get(interval, 120)
+    limit   = GLOBAL["stale_max_min"].get(interval, 120)
+
+    # allow exchange-closed weekend data to pass (only for venue instruments)
+    kind = INSTRUMENTS[instrument]["kind"]
+    if kind != "crypto" and is_weekend_zone(now_utc()):
+        limit += GLOBAL["weekend_stale_extend_min"]
+
     if age_min > limit:
-        logging.warning(f"[sanitize] stale data interval={interval} age={age_min:.1f}m > {limit}m")
+        logging.info(f"[sanitize] {instrument} {interval} stale age={age_min:.0f}m > {limit}m")
         return None
     if len(df) < min_bars:
         return None
     return df
 
-def fetch_data(instrument: str, interval: str, period: str, min_bars: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+def fetch_data(instrument: str, interval: str, period: str,
+               min_bars: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     cfg = INSTRUMENTS[instrument]
     for src in cfg["sources"]:
         df = None
@@ -221,12 +276,11 @@ def fetch_data(instrument: str, interval: str, period: str, min_bars: int) -> Tu
                 if gran is None:
                     continue
                 df = fetch_coinbase(src["symbol"], gran)
-        except Exception as e:
-            logging.warning(f"[fetch] {instrument} {src} exception: {e}")
+        except Exception:
             continue
         if df is None:
             continue
-        df = sanitize_df(df, interval, min_bars)
+        df = sanitize_df(df, interval, min_bars, instrument)
         if df is None:
             continue
         mul = src.get("multiplier", cfg["multiplier"])
@@ -242,9 +296,7 @@ def fetch_data(instrument: str, interval: str, period: str, min_bars: int) -> Tu
 # ==============================================================================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    close = df["Close"]
-    high  = df["High"]
-    low   = df["Low"]
+    close, high, low = df["Close"], df["High"], df["Low"]
 
     df["ema20"]  = close.ewm(span=20,  adjust=False).mean()
     df["ema50"]  = close.ewm(span=50,  adjust=False).mean()
@@ -253,8 +305,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat(
         [(high - low),
          (high - close.shift()).abs(),
-         (low  - close.shift()).abs()],
-        axis=1,
+         (low  - close.shift()).abs()], axis=1,
     ).max(axis=1)
     df["atr14"] = tr.rolling(14).mean()
 
@@ -264,7 +315,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs    = gain / (loss + 1e-8)
     df["rsi14"] = 100.0 - (100.0 / (1.0 + rs))
 
-    df["zscore20"] = (close - close.rolling(20).mean()) / (close.rolling(20).std() + 1e-8)
+    df["zscore20"] = ((close - close.rolling(20).mean())
+                      / (close.rolling(20).std() + 1e-8))
     df["slope20"]  = df["ema20"].diff(5) / 5.0
     return df
 
@@ -272,9 +324,7 @@ def detect_structure(df: pd.DataFrame, lookback: int = 5) -> Tuple[pd.Series, pd
     w = lookback * 2 + 1
     highs = df["High"].rolling(w, center=True).max()
     lows  = df["Low"].rolling(w, center=True).min()
-    sh = (df["High"] == highs).fillna(False)
-    sl = (df["Low"]  == lows ).fillna(False)
-    return sh, sl
+    return (df["High"] == highs).fillna(False), (df["Low"] == lows).fillna(False)
 
 def detect_regime(df: pd.DataFrame) -> str:
     if len(df) < 60:
@@ -302,8 +352,7 @@ def spike_ok(df: pd.DataFrame) -> bool:
     mu, sd = float(ret.mean()), float(ret.std())
     if not np.isfinite(sd) or sd < 1e-9:
         return True
-    z_last = (ret.iloc[-1] - mu) / sd
-    return abs(z_last) < GLOBAL["spike_z_threshold"]
+    return abs((ret.iloc[-1] - mu) / sd) < GLOBAL["spike_z_threshold"]
 
 # ==============================================================================
 # SIGNAL LOGIC
@@ -328,20 +377,22 @@ def calc_lot(balance: float, risk_pct: float, sl_dist: float,
     return round(lot, 2)
 
 def _wick_ok(candle: pd.Series) -> Tuple[bool, bool]:
-    rng = max(float(candle["High"]) - float(candle["Low"]), 1e-9)
+    rng  = max(float(candle["High"]) - float(candle["Low"]), 1e-9)
     body = abs(float(candle["Close"]) - float(candle["Open"]))
     upper = float(candle["High"]) - max(float(candle["Close"]), float(candle["Open"]))
     lower = min(float(candle["Close"]), float(candle["Open"])) - float(candle["Low"])
     body_ratio = body / rng
-    ok_buy  = (lower / rng) < 0.55 and body_ratio > 0.25
-    ok_sell = (upper / rng) < 0.55 and body_ratio > 0.25
-    return ok_buy, ok_sell
+    return (lower / rng) < 0.55 and body_ratio > 0.25, \
+           (upper / rng) < 0.55 and body_ratio > 0.25
 
 def evaluate_signal(instrument: str, mode: str) -> Optional[Dict[str, Any]]:
     cfg = INSTRUMENTS[instrument]
     tf  = TIMEFRAMES[mode]
 
-    # session filter
+    if not market_open(instrument):
+        logging.info(f"[market-closed] {instrument} {mode} - skip")
+        return None
+
     hour_utc = now_utc().hour
     if cfg["session_filter"] and mode == "SCALPING" and hour_utc not in cfg["session_hours"]:
         return None
@@ -366,41 +417,42 @@ def evaluate_signal(instrument: str, mode: str) -> Optional[Dict[str, Any]]:
     htf_trend = 1 if df_htf["ema20"].iloc[-1] > df_htf["ema50"].iloc[-1] else -1
 
     sh_mask, sl_mask = detect_structure(df_htf, lookback=5)
-    last_swing_high = float(df_htf.loc[sh_mask, "High"].iloc[-1]) if sh_mask.any() else float(df_htf["High"].iloc[-30:].max())
-    last_swing_low  = float(df_htf.loc[sl_mask, "Low" ].iloc[-1]) if sl_mask.any() else float(df_htf["Low" ].iloc[-30:].min())
+    last_swing_high = (float(df_htf.loc[sh_mask, "High"].iloc[-1])
+                       if sh_mask.any() else float(df_htf["High"].iloc[-30:].max()))
+    last_swing_low  = (float(df_htf.loc[sl_mask, "Low"].iloc[-1])
+                       if sl_mask.any() else float(df_htf["Low"].iloc[-30:].min()))
     htf_close = float(df_htf["Close"].iloc[-1])
-
     bullish_bos = htf_close > last_swing_high * (1.0 + 1e-6)
     bearish_bos = htf_close < last_swing_low  * (1.0 - 1e-6)
 
     last = df_ent.iloc[-1]
-    rsi  = float(last["rsi14"]) if np.isfinite(last["rsi14"]) else 50.0
+    rsi  = float(last["rsi14"])    if np.isfinite(last["rsi14"])    else 50.0
     zsc  = float(last["zscore20"]) if np.isfinite(last["zscore20"]) else 0.0
-    atr  = float(last["atr14"]) if np.isfinite(last["atr14"]) else 0.0
+    atr  = float(last["atr14"])    if np.isfinite(last["atr14"])    else 0.0
     if atr <= 0:
         return None
 
     bull_candle = float(last["Close"]) > float(last["Open"])
     wick_buy_ok, wick_sell_ok = _wick_ok(last)
 
-    score_buy = 0
+    score_buy  = 0
     score_sell = 0
 
-    if htf_trend == 1:  score_buy  += 15
-    else:               score_sell += 15
+    if htf_trend == 1: score_buy  += 15
+    else:              score_sell += 15
 
-    if bullish_bos:  score_buy  += 20
-    if bearish_bos:  score_sell += 20
+    if bullish_bos: score_buy  += 20
+    if bearish_bos: score_sell += 20
 
     if regime == "TREND":
         score_buy  += 10
         score_sell += 10
 
-    if float(last["Close"]) > float(last["ema20"]):  score_buy  += 10
-    if float(last["Close"]) < float(last["ema20"]):  score_sell += 10
+    if float(last["Close"]) > float(last["ema20"]): score_buy  += 10
+    if float(last["Close"]) < float(last["ema20"]): score_sell += 10
 
-    if 52 < rsi < 75:  score_buy  += 10
-    if 25 < rsi < 48:  score_sell += 10
+    if 52 < rsi < 75: score_buy  += 10
+    if 25 < rsi < 48: score_sell += 10
 
     if abs(zsc) < 2.0:
         score_buy  += 5
@@ -409,12 +461,12 @@ def evaluate_signal(instrument: str, mode: str) -> Optional[Dict[str, Any]]:
     if bull_candle: score_buy += 10
     else:           score_sell += 10
 
-    if bull_candle and wick_buy_ok:      score_buy  += 10
+    if bull_candle      and wick_buy_ok:  score_buy  += 10
     if (not bull_candle) and wick_sell_ok: score_sell += 10
 
-    if score_buy >= score_sell and htf_trend == 1 and score_buy >= GLOBAL["min_score_signal"]:
-        direction, score = "BUY", score_buy
-    elif score_sell > score_buy and htf_trend == -1 and score_sell >= GLOBAL["min_score_signal"]:
+    if htf_trend == 1  and score_buy  >= GLOBAL["min_score_signal"] and score_buy  >= score_sell:
+        direction, score = "BUY",  score_buy
+    elif htf_trend == -1 and score_sell >= GLOBAL["min_score_signal"] and score_sell > score_buy:
         direction, score = "SELL", score_sell
     else:
         return None
@@ -431,64 +483,42 @@ def evaluate_signal(instrument: str, mode: str) -> Optional[Dict[str, Any]]:
         tp2 = entry - tf["tp_atr"][1] * atr
         tp3 = entry - tf["tp_atr"][2] * atr
 
-    # entry zone validity: current price must be within max_entry_chase_atr of entry (same bar)
     if abs(entry - float(last["Close"])) > GLOBAL["max_entry_chase_atr"] * atr:
         return None
-
     if not validate_prices(direction, entry, sl, tp1, tp2, tp3):
         return None
 
-    balance = float(ACCOUNT["balance"])
+    balance  = float(ACCOUNT["balance"])
     risk_pct = ACCOUNT["risk_pct_scalp"] if mode == "SCALPING" else ACCOUNT["risk_pct_swing"]
-    sl_dist = abs(entry - sl)
-    lot = calc_lot(balance, risk_pct, sl_dist, cfg["contract"])
+    lot = calc_lot(balance, risk_pct, abs(entry - sl), cfg["contract"])
 
     return {
-        "instrument": instrument,
-        "mode":       mode,
-        "direction":  direction,
-        "entry":      round(entry, 5),
-        "sl":         round(sl, 5),
-        "tp1":        round(tp1, 5),
-        "tp2":        round(tp2, 5),
-        "tp3":        round(tp3, 5),
-        "lot":        lot,
-        "score":      int(min(100, score)),
-        "regime":     regime,
-        "source":     f"{src_htf} | {src_ent}",
-        "atr":        round(atr, 5),
-        "rsi":        round(rsi, 2),
-        "zscore":     round(zsc, 3),
-        "ts":         now_utc_iso(),
+        "instrument": instrument, "mode": mode, "direction": direction,
+        "entry": round(entry, 5), "sl": round(sl, 5),
+        "tp1": round(tp1, 5), "tp2": round(tp2, 5), "tp3": round(tp3, 5),
+        "lot": lot, "score": int(min(100, score)), "regime": regime,
+        "source": f"{src_htf} | {src_ent}",
+        "atr": round(atr, 5), "rsi": round(rsi, 2), "zscore": round(zsc, 3),
+        "ts": now_utc_iso(),
     }
 
 # ==============================================================================
-# SQLITE STATE
+# SQLITE
 # ==============================================================================
 def db_init(conn: sqlite3.Connection) -> None:
-    cur = conn.cursor()
-    cur.executescript("""
+    conn.executescript("""
     CREATE TABLE IF NOT EXISTS signals (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts        TEXT NOT NULL,
-        instrument TEXT NOT NULL,
-        mode      TEXT NOT NULL,
-        direction TEXT NOT NULL,
-        entry     REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-        lot       REAL, score INTEGER, regime TEXT,
-        message   TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL, instrument TEXT NOT NULL, mode TEXT NOT NULL,
+        direction TEXT NOT NULL, entry REAL, sl REAL,
+        tp1 REAL, tp2 REAL, tp3 REAL, lot REAL,
+        score INTEGER, regime TEXT, message TEXT
     );
     CREATE TABLE IF NOT EXISTS cooldown (
-        instrument TEXT NOT NULL,
-        mode       TEXT NOT NULL,
-        direction  TEXT NOT NULL,
-        last_ts    TEXT NOT NULL,
-        PRIMARY KEY (instrument, mode)
+        instrument TEXT NOT NULL, mode TEXT NOT NULL, direction TEXT NOT NULL,
+        last_ts TEXT NOT NULL, PRIMARY KEY (instrument, mode)
     );
-    CREATE TABLE IF NOT EXISTS state (
-        key   TEXT PRIMARY KEY,
-        value TEXT
-    );
+    CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
     """)
     conn.commit()
 
@@ -497,95 +527,75 @@ def get_state(conn: sqlite3.Connection, key: str, default: Optional[str] = None)
     return row[0] if row else default
 
 def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
-    conn.execute(
-        "INSERT INTO state(key,value) VALUES(?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
+    conn.execute("INSERT INTO state(key,value) VALUES(?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
     conn.commit()
 
 def cooldown_ok(conn: sqlite3.Connection, inst: str, mode: str, direction: str) -> bool:
-    row = conn.execute(
-        "SELECT direction, last_ts FROM cooldown WHERE instrument=? AND mode=?",
-        (inst, mode),
-    ).fetchone()
+    row = conn.execute("SELECT direction, last_ts FROM cooldown WHERE instrument=? AND mode=?",
+                       (inst, mode)).fetchone()
     if not row:
         return True
     last_dir, last_ts = row
     age_min = (now_utc() - _parse_ts(last_ts)).total_seconds() / 60.0
-    if last_dir == direction:
-        return age_min >= GLOBAL["cooldown_same_min"]
-    return age_min >= GLOBAL["cooldown_flip_min"]
+    return age_min >= (GLOBAL["cooldown_same_min"] if last_dir == direction
+                       else GLOBAL["cooldown_flip_min"])
 
 def set_cooldown(conn: sqlite3.Connection, inst: str, mode: str, direction: str) -> None:
     conn.execute(
         "INSERT INTO cooldown(instrument,mode,direction,last_ts) VALUES(?,?,?,?) "
         "ON CONFLICT(instrument,mode) DO UPDATE SET direction=excluded.direction, last_ts=excluded.last_ts",
-        (inst, mode, direction, now_utc_iso()),
-    )
+        (inst, mode, direction, now_utc_iso()))
     conn.commit()
 
 def save_signal(conn: sqlite3.Connection, sig: Dict[str, Any], message: str) -> None:
-    conn.execute("""
-        INSERT INTO signals(ts,instrument,mode,direction,entry,sl,tp1,tp2,tp3,lot,score,regime,message)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (sig["ts"], sig["instrument"], sig["mode"], sig["direction"],
-          sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"],
-          sig["lot"], sig["score"], sig["regime"], message))
+    conn.execute("""INSERT INTO signals
+        (ts,instrument,mode,direction,entry,sl,tp1,tp2,tp3,lot,score,regime,message)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (sig["ts"], sig["instrument"], sig["mode"], sig["direction"],
+         sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"],
+         sig["lot"], sig["score"], sig["regime"], message))
     conn.commit()
 
 # ==============================================================================
-# TELEGRAM / DISCORD NOTIFIER
+# NOTIFIER
 # ==============================================================================
 def send_telegram(text: str, chat_id: Optional[str] = None, retries: int = 5) -> bool:
-    token = TELEGRAM_BOT_TOKEN
-    if not token:
+    if not TELEGRAM_BOT_TOKEN:
         return False
     cid = chat_id or TELEGRAM_CHAT_ID
     if not cid:
         return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    delay = 1.0
+    url, delay = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 1.0
     for _ in range(retries):
         try:
             r = requests.post(url, json={
-                "chat_id": cid,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }, timeout=20)
+                "chat_id": cid, "text": text, "parse_mode": "HTML",
+                "disable_web_page_preview": True}, timeout=20)
             if r.ok:
                 return True
             if r.status_code == 429:
-                try:
-                    wait = float(r.json().get("parameters", {}).get("retry_after", delay))
-                except Exception:
-                    wait = delay
-                time.sleep(wait)
-                continue
-            time.sleep(delay)
-            delay = min(delay * 2, 30.0)
-        except Exception as e:
-            logging.warning(f"[telegram] send failed: {e}")
-            time.sleep(delay)
-            delay = min(delay * 2, 30.0)
+                wait = float(r.json().get("parameters", {}).get("retry_after", delay))
+                time.sleep(wait); continue
+            time.sleep(delay); delay = min(delay * 2, 30.0)
+        except Exception:
+            time.sleep(delay); delay = min(delay * 2, 30.0)
     return False
 
 def send_discord(text: str, retries: int = 3) -> bool:
     if not DISCORD_WEBHOOK_URL:
         return False
+    plain = (text.replace("<b>", "**").replace("</b>", "**")
+                  .replace("<code>", "`").replace("</code>", "`"))
     delay = 1.0
-    plain = text.replace("<b>", "**").replace("</b>", "**").replace("<code>", "`").replace("</code>", "`")
     for _ in range(retries):
         try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json={"content": plain}, timeout=20)
-            if r.ok:
+            if requests.post(DISCORD_WEBHOOK_URL, json={"content": plain},
+                             timeout=20).ok:
                 return True
-            time.sleep(delay)
-            delay = min(delay * 2, 20.0)
+            time.sleep(delay); delay = min(delay * 2, 20.0)
         except Exception:
-            time.sleep(delay)
-            delay = min(delay * 2, 20.0)
+            time.sleep(delay); delay = min(delay * 2, 20.0)
     return False
 
 def format_signal_message(sig: Dict[str, Any]) -> str:
@@ -600,24 +610,20 @@ def format_signal_message(sig: Dict[str, Any]) -> str:
     )
 
 # ==============================================================================
-# TELEGRAM /CHECK HANDLER
+# TELEGRAM /CHECK
 # ==============================================================================
 def build_status_summary(conn: sqlite3.Connection) -> str:
     lines = ["📊 <b>Status 4 Instrumen</b>"]
     for inst in INSTRUMENTS.keys():
         row = conn.execute(
-            "SELECT ts, mode, direction, entry, score, regime "
-            "FROM signals WHERE instrument=? ORDER BY id DESC LIMIT 1",
-            (inst,),
-        ).fetchone()
+            "SELECT ts,mode,direction,entry,score,regime FROM signals "
+            "WHERE instrument=? ORDER BY id DESC LIMIT 1", (inst,)).fetchone()
         if row:
             ts, mode, direction, entry, score, regime = row
             age_min = int((now_utc() - _parse_ts(ts)).total_seconds() / 60.0)
             mode_short = "SCALP" if mode == "SCALPING" else "SWING"
-            lines.append(
-                f"• <b>{inst}</b> — {direction} ({mode_short}) @ {entry:.2f} | "
-                f"skor {score} | {regime} | {age_min}m lalu"
-            )
+            lines.append(f"• <b>{inst}</b> — {direction} ({mode_short}) @ {entry:.2f} | "
+                         f"skor {score} | {regime} | {age_min}m lalu")
         else:
             lines.append(f"• <b>{inst}</b> — belum ada sinyal")
     lines.append(f"🕒 <code>{now_utc().strftime('%H:%M UTC')}</code>")
@@ -631,8 +637,7 @@ def handle_telegram_commands(conn: sqlite3.Connection) -> None:
         r = requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
             params={"offset": last_id + 1, "timeout": 5, "allowed_updates": '["message"]'},
-            timeout=20,
-        )
+            timeout=20)
         if not r.ok:
             return
         updates = r.json().get("result", []) or []
@@ -641,11 +646,9 @@ def handle_telegram_commands(conn: sqlite3.Connection) -> None:
         return
 
     for u in updates:
-        uid = int(u.get("update_id", 0))
-        last_id = max(last_id, uid)
+        last_id = max(last_id, int(u.get("update_id", 0)))
         msg = u.get("message") or {}
-        chat = msg.get("chat") or {}
-        cid = str(chat.get("id", ""))
+        cid = str((msg.get("chat") or {}).get("id", ""))
         text = (msg.get("text") or "").strip()
         if cid != str(TELEGRAM_CHAT_ID):
             continue
@@ -654,104 +657,110 @@ def handle_telegram_commands(conn: sqlite3.Connection) -> None:
     set_state(conn, "last_update_id", str(last_id))
 
 # ==============================================================================
-# BACKTEST + GRID SEARCH + AUDIT + CHART
+# BACKTEST (realistic: risk-based sizing, DD stop, min-trades)
 # ==============================================================================
 def _bt_signal_at(df: pd.DataFrame, i: int, threshold: int) -> Optional[Tuple[str, float, float]]:
     if i < 60:
         return None
-    w = df.iloc[: i + 1]
-    last = w.iloc[-1]
-    if not (np.isfinite(last["rsi14"]) and np.isfinite(last["zscore20"]) and np.isfinite(last["atr14"])):
-        return None
+    last = df.iloc[i]
+    for c in ("rsi14", "zscore20", "atr14", "ema20", "ema50"):
+        if not np.isfinite(last[c]):
+            return None
     if last["atr14"] <= 0:
         return None
-    up = float(last["ema20"]) > float(last["ema50"])
-    rsi = float(last["rsi14"])
-    z   = float(last["zscore20"])
-    score_buy = 0
-    score_sell = 0
-    if up: score_buy += 30
-    else:  score_sell += 30
-    if 50 < rsi < 75: score_buy += 20
-    if 25 < rsi < 50: score_sell += 20
+
+    up      = float(last["ema20"]) > float(last["ema50"])
+    rsi     = float(last["rsi14"])
+    z       = float(last["zscore20"])
+    close   = float(last["Close"])
+    ema20   = float(last["ema20"])
+    bullish = close > float(last["Open"])
+
+    sb = ss = 0
+    if up: sb += 30
+    else:  ss += 30
+    if 52 < rsi < 75: sb += 20
+    if 25 < rsi < 48: ss += 20
     if abs(z) < 2.0:
-        score_buy  += 10
-        score_sell += 10
-    if float(last["Close"]) > float(last["Open"]): score_buy += 20
-    else: score_sell += 20
-    if up and score_buy >= threshold:
-        return "BUY", float(last["Close"]), float(last["atr14"])
-    if (not up) and score_sell >= threshold:
-        return "SELL", float(last["Close"]), float(last["atr14"])
+        sb += 10; ss += 10
+    if bullish: sb += 20
+    else:       ss += 20
+    if close > ema20: sb += 10
+    if close < ema20: ss += 10
+
+    if up and sb >= threshold:  return "BUY",  close, float(last["atr14"])
+    if (not up) and ss >= threshold: return "SELL", close, float(last["atr14"])
     return None
 
 def backtest_simple(df: pd.DataFrame, params: Dict[str, float]) -> Dict[str, Any]:
-    spread = float(params["spread"])
-    slip   = float(params["slippage"])
-    sl_mult = float(params["sl_mult"])
-    tp_mult = float(params["tp_mult"])
+    spread    = float(params["spread"])
+    slip      = float(params["slippage"])
+    sl_mult   = float(params["sl_mult"])
+    tp_mult   = float(params["tp_mult"])
     threshold = int(params["threshold"])
     lookahead = int(params.get("lookahead", 20))
+    risk_pct  = float(GLOBAL["bt_risk_pct"])
+    min_eq    = float(GLOBAL["bt_min_equity"])
+    dd_stop   = float(GLOBAL["bt_max_dd_stop"])
 
-    equity = 10000.0
-    curve  = [equity]
-    trades: List[Dict[str, Any]] = []
+    equity, peak = 10000.0, 10000.0
+    curve, trades = [equity], []
 
     for i in range(60, len(df) - lookahead - 1):
+        if equity < min_eq:
+            break
+        if (peak - equity) / max(peak, 1e-9) > dd_stop:
+            break
+
         sig = _bt_signal_at(df, i, threshold)
         if sig is None:
             continue
         direction, entry_px, atr = sig
+
         if direction == "BUY":
             fill = entry_px + spread / 2.0 + slip
             sl   = entry_px - sl_mult * atr
             tp   = entry_px + tp_mult * atr
-            exit_reason = None
-            pnl = 0.0
-            for j in range(i + 1, min(i + lookahead + 1, len(df))):
-                lo, hi = float(df["Low"].iloc[j]), float(df["High"].iloc[j])
-                if lo <= sl:
-                    pnl = -(fill - sl)
-                    exit_reason = "SL"
-                    break
-                if hi >= tp:
-                    pnl = tp - fill
-                    exit_reason = "TP"
-                    break
-            if exit_reason is None:
-                continue
         else:
             fill = entry_px - spread / 2.0 - slip
             sl   = entry_px + sl_mult * atr
             tp   = entry_px - tp_mult * atr
-            exit_reason = None
-            pnl = 0.0
-            for j in range(i + 1, min(i + lookahead + 1, len(df))):
-                lo, hi = float(df["Low"].iloc[j]), float(df["High"].iloc[j])
-                if hi >= sl:
-                    pnl = -(sl - fill)
-                    exit_reason = "SL"
-                    break
-                if lo <= tp:
-                    pnl = fill - tp
-                    exit_reason = "TP"
-                    break
-            if exit_reason is None:
-                continue
+
+        sl_dist = abs(fill - sl)
+        if sl_dist <= 0:
+            continue
+        units = (equity * risk_pct) / sl_dist
+        if units <= 0:
+            continue
+
+        exit_price, exit_reason = None, None
+        for j in range(i + 1, min(i + lookahead + 1, len(df))):
+            lo, hi = float(df["Low"].iloc[j]), float(df["High"].iloc[j])
+            if direction == "BUY":
+                if lo <= sl: exit_price, exit_reason = sl, "SL"; break
+                if hi >= tp: exit_price, exit_reason = tp, "TP"; break
+            else:
+                if hi >= sl: exit_price, exit_reason = sl, "SL"; break
+                if lo <= tp: exit_price, exit_reason = tp, "TP"; break
+
+        if exit_reason is None:
+            continue
+
+        pnl = ((exit_price - fill) if direction == "BUY" else (fill - exit_price)) * units
         equity += pnl
+        peak    = max(peak, equity)
         curve.append(equity)
         trades.append({"pnl": pnl, "exit": exit_reason})
 
-    if len(trades) < 5:
+    if len(trades) < GLOBAL["bt_min_trades"]:
         return {"score": -1e9, "trades": len(trades), "winrate": 0.0,
-                "max_dd": 0.0, "equity_curve": curve, "params": params}
+                "max_dd": 0.0, "total_pnl": 0.0, "equity_curve": curve, "params": params}
 
-    wins = sum(1 for t in trades if t["pnl"] > 0)
-    winrate = wins / len(trades)
-    total   = sum(t["pnl"] for t in trades)
+    wins     = sum(1 for t in trades if t["pnl"] > 0)
+    winrate  = wins / len(trades)
+    total    = sum(t["pnl"] for t in trades)
 
-    peak = curve[0]
-    max_dd = 0.0
+    peak, max_dd = curve[0], 0.0
     for v in curve:
         peak = max(peak, v)
         if peak > 0:
@@ -760,11 +769,9 @@ def backtest_simple(df: pd.DataFrame, params: Dict[str, float]) -> Dict[str, Any
     consistency = min(1.0, len(trades) / 60.0)
     score = total * winrate * (1.0 - max_dd) * consistency
 
-    return {
-        "score": score, "trades": len(trades), "winrate": winrate,
-        "max_dd": max_dd, "total_pnl": total,
-        "equity_curve": curve, "params": params,
-    }
+    return {"score": score, "trades": len(trades), "winrate": winrate,
+            "max_dd": max_dd, "total_pnl": total,
+            "equity_curve": curve, "params": params}
 
 def grid_search(df: pd.DataFrame, instrument: str, mode: str) -> Optional[Dict[str, Any]]:
     spread   = GLOBAL["spread_pts"].get(instrument, 1.0)
@@ -778,13 +785,12 @@ def grid_search(df: pd.DataFrame, instrument: str, mode: str) -> Optional[Dict[s
     for slm in grid["sl_mult"]:
         for tpm in grid["tp_mult"]:
             for th in grid["threshold"]:
-                params = {"spread": spread, "slippage": slippage,
-                          "sl_mult": slm, "tp_mult": tpm, "threshold": th,
-                          "lookahead": 20}
-                res = backtest_simple(df, params)
+                p = {"spread": spread, "slippage": slippage,
+                     "sl_mult": slm, "tp_mult": tpm, "threshold": th,
+                     "lookahead": 20}
+                res = backtest_simple(df, p)
                 if best is None or res["score"] > best["score"]:
-                    res["instrument"] = instrument
-                    res["mode"] = mode
+                    res["instrument"], res["mode"] = instrument, mode
                     best = res
     return best
 
@@ -806,14 +812,11 @@ def plot_performance(curves: Dict[str, List[float]], path: str) -> None:
         plt.figure(figsize=(10, 5))
         for name, curve in curves.items():
             plt.plot(curve, label=name)
-        plt.title("Backtest Equity Curves (spread+slippage applied)")
-        plt.xlabel("Trade #")
-        plt.ylabel("Equity ($)")
+        plt.title("Backtest Equity Curves (risk-sized, spread+slippage applied)")
+        plt.xlabel("Trade #"); plt.ylabel("Equity ($)")
         plt.legend(loc="best", fontsize=8)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(path, dpi=110)
-        plt.close()
+        plt.grid(True, alpha=0.3); plt.tight_layout()
+        plt.savefig(path, dpi=110); plt.close()
         logging.info(f"[plot] saved {path}")
     except Exception as e:
         logging.warning(f"[plot] failed: {e}")
@@ -826,7 +829,7 @@ def run_backtests(conn: sqlite3.Connection) -> None:
     for inst in INSTRUMENTS.keys():
         df, src = fetch_data(inst, "1h", "60d", 200)
         if df is None:
-            logging.warning(f"[backtest] {inst} no data")
+            logging.info(f"[backtest] {inst} - no fresh data (skip)")
             continue
         df = compute_indicators(df)
         if len(df) < 250:
@@ -835,17 +838,15 @@ def run_backtests(conn: sqlite3.Connection) -> None:
         if best is None:
             continue
         logging.info(
-            f"[backtest] {inst} best params={best['params']} "
+            f"[backtest] {inst} params={best['params']} "
             f"score={best['score']:.2f} trades={best['trades']} "
-            f"winrate={best['winrate']:.2f} maxDD={best['max_dd']:.2f}"
-        )
-        curves[f"{inst}"] = best["equity_curve"]
+            f"winrate={best['winrate']:.2f} maxDD={best['max_dd']:.2%}")
+        curves[inst] = best["equity_curve"]
         forensic_audit_log(
             inst, "SWING", src or "n/a", df, df,
             {"best_params": best["params"], "best_score": round(best["score"], 2),
              "trades": best["trades"], "winrate": round(best["winrate"], 3),
-             "max_dd": round(best["max_dd"], 3)},
-        )
+             "max_dd": round(best["max_dd"], 3)})
     if curves:
         plot_performance(curves, CHART_PATH)
 
@@ -865,36 +866,30 @@ def process_signal(conn: sqlite3.Connection, sig: Dict[str, Any]) -> bool:
 def main() -> None:
     setup_logging()
     logging.info(f"[run] start {now_utc_iso()}")
-
     conn = sqlite3.connect(DB_PATH)
     try:
         db_init(conn)
-
-        # /check polling (also doubles as lightweight keep-alive)
         handle_telegram_commands(conn)
 
-        # signal generation for all instruments & modes
         for mode in ["SCALPING", "SWING"]:
             for inst in INSTRUMENTS.keys():
                 try:
                     sig = evaluate_signal(inst, mode)
                 except Exception as e:
-                    logging.exception(f"[eval] {inst} {mode} exception: {e}")
+                    logging.exception(f"[eval] {inst} {mode}: {e}")
                     continue
                 if sig is None:
                     logging.info(f"[no-signal] {inst} {mode}")
                     continue
                 process_signal(conn, sig)
 
-        # periodic backtest (kept lightweight; runs on every invocation)
         try:
             run_backtests(conn)
         except Exception as e:
             logging.exception(f"[backtest] failed: {e}")
 
     except Exception as e:
-        tb = traceback.format_exc()
-        logging.error(f"[fatal] {e}\n{tb}")
+        logging.error(f"[fatal] {e}\n{traceback.format_exc()}")
         send_telegram(f"⚠️ <b>Bot error</b>\n<code>{str(e)[:300]}</code>")
     finally:
         conn.close()
