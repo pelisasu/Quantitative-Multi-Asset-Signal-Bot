@@ -1,0 +1,14 @@
+{
+  "XAUUSD:SWING": {
+    "sl_mult": 2.5,
+    "tp_mult": 3.0,
+    "threshold": 68,
+    "updated_at": "2026-11-23T08:15:45Z"
+  },
+  "BTCUSD:SWING": {
+    "sl_mult": 2.5,
+    "tp_mult": 3.0,
+    "threshold": 68,
+    "updated_at": "2026-11-23T08:15:53Z"
+  }
+}
