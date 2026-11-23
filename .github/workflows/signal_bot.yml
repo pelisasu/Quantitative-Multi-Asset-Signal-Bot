@@ -1,0 +1,101 @@
+name: Quantitative Multi-Asset Signal Bot
+
+on:
+  schedule:
+    # Berjalan rapat setiap 5 menit (waktu UTC)
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode evaluasi sinyal"
+        required: false
+        default: "ALL"
+        type: choice
+        options:
+          - ALL
+          - SCALPING
+          - SWING
+      force_backtest:
+        description: "Regenerasi grafik backtest_performance.png"
+        required: false
+        default: false
+        type: boolean
+      force_optimize:
+        description: "Jalankan ulang grid-search parameter"
+        required: false
+        default: false
+        type: boolean
+      force_check:
+        description: "Kirim ringkasan status 4 instrumen ke Telegram"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: trading-signal-bot-state
+  cancel-in-progress: false
+
+jobs:
+  run-signal-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore SQLite State & Backtest Chart
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trading_signals.db
+            trading_signals.db-wal
+            trading_signals.db-shm
+            backtest_performance.png
+          key: signal-bot-state-${{ github.run_id }}
+          restore-keys: |
+            signal-bot-state-
+
+      - name: Execute Signal Bot
+        env:
+          TZ: UTC
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_MODE_FILTER: ${{ github.event.inputs.mode || 'ALL' }}
+          FORCE_BACKTEST: ${{ github.event.inputs.force_backtest || 'false' }}
+          FORCE_OPTIMIZE: ${{ github.event.inputs.force_optimize || 'false' }}
+          FORCE_CHECK: ${{ github.event.inputs.force_check || 'false' }}
+        run: python bot.py
+
+      - name: Save SQLite State & Backtest Chart
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_signals.db
+            trading_signals.db-wal
+            trading_signals.db-shm
+            backtest_performance.png
+          key: signal-bot-state-${{ github.run_id }}
+
+      - name: Upload Artifacts (DB & Performance Chart)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-state-${{ github.run_id }}
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          retention-days: 14
