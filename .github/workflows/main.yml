@@ -4,8 +4,8 @@ on:
   schedule:
     # Live lightweight scan every 15 minutes
     - cron: "*/15 * * * *"
-    # Daily walk-forward calibration at 00:05 UTC
-    - cron: "5 0 * * *"
+    # Weekly walk-forward calibration every Sunday at 00:05 UTC
+    - cron: "5 0 * * 0"
   workflow_dispatch:
     inputs:
       mode:
@@ -15,6 +15,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: quant-signal-bot-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -37,7 +41,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python bot_hardened.py --mode "${{ github.event.inputs.mode }}"
-          elif [ "${{ github.event.schedule }}" = "5 0 * * *" ]; then
+          elif [ "${{ github.event.schedule }}" = "5 0 * * 0" ]; then
             python bot_hardened.py --mode backtest
           else
             python bot_hardened.py --mode live
@@ -46,7 +50,20 @@ jobs:
       - name: Persist SQLite state & calibrated params
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add trading_signals.db calibrated_params.json backtest_performance_v2.png || true
-          git diff --staged --quiet || git commit -m "chore: update signal state & calibration"
-          git push
+          if git diff --staged --quiet; then
+            echo "No state or calibration changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update signal state & calibration"
+
+          BRANCH="${{ github.ref_name }}"
+          for i in 1 2 3; do
+            git pull --rebase -X theirs origin "$BRANCH" && git push origin "$BRANCH" && exit 0
+            echo "Push race detected, retrying ($i/3)..."
+            sleep 2
+          done
+          exit 1
