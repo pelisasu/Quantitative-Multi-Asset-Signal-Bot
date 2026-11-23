@@ -419,7 +419,11 @@ def detect_regime_row(row: pd.Series) -> str:
     if rk < 0.12 and er < 0.22 and adx < 16.0:
         return "CHOPPY"
     ema_sep_atr = abs(e20 - e50) / max(atr, 1e-9)
-    if (adx >= 22.0 and er >= 0.26) or (er >= 0.38 and ema_sep_atr >= 0.45):
+    if (
+        (adx >= 22.0 and er >= 0.24)
+        or (adx >= 28.0 and er >= 0.12 and ema_sep_atr >= 0.35)
+        or (er >= 0.36 and ema_sep_atr >= 0.45)
+    ):
         return "TREND"
     if adx < 17.0 and er < 0.22:
         return "CHOPPY"
@@ -452,25 +456,26 @@ def _wick_rejection(candle: pd.Series) -> Tuple[bool, bool]:
         (upper / rng) > 0.28 and body_ratio > 0.12 and close_pos <= 0.45,
     )
 
-def _fresh_bos_bars_ago(htf_closes: np.ndarray, swing_levels: np.ndarray,
+def _fresh_bos_bars_ago(htf_closes: np.ndarray, htf_sh: np.ndarray, htf_sl: np.ndarray,
                         htf_idx: int, direction: str) -> Optional[int]:
-    cur_sw = swing_levels[htf_idx]
-    if not np.isfinite(cur_sw):
-        return None
-    cur_c = htf_closes[htf_idx]
-    broken = (cur_c > cur_sw * (1.0 + 1e-6)) if direction == "BUY" else (cur_c < cur_sw * (1.0 - 1e-6))
-    if not broken:
-        return None
-    for b in range(0, min(25, htf_idx)):
+    def is_broken_at(idx: int, d: str) -> bool:
+        sw = htf_sh[idx] if d == "BUY" else htf_sl[idx]
+        if not np.isfinite(sw):
+            return False
+        c = htf_closes[idx]
+        return (c > sw * (1.0 + 1e-6)) if d == "BUY" else (c < sw * (1.0 - 1e-6))
+
+    opp_dir = "SELL" if direction == "BUY" else "BUY"
+    max_look = min(int(GLOBAL["bos_fresh_max_bars"]), htf_idx - 1)
+    for b in range(0, max_look + 1):
         k = htf_idx - b
-        prev_sw = swing_levels[k - 1]
-        if not np.isfinite(prev_sw):
-            return b
-        prev_c = htf_closes[k - 1]
-        prev_broken = (prev_c > prev_sw * (1.0 + 1e-6)) if direction == "BUY" else (prev_c < prev_sw * (1.0 - 1e-6))
-        if not prev_broken:
-            return b
-    return 25
+        if is_broken_at(k, opp_dir):
+            return None
+        if is_broken_at(k, direction):
+            prev_sw = htf_sh[k - 1] if direction == "BUY" else htf_sl[k - 1]
+            if not np.isfinite(prev_sw) or not is_broken_at(k - 1, direction):
+                return b
+    return 25 if is_broken_at(htf_idx, direction) else None
 
 def evaluate_bar_pair(htf_df: pd.DataFrame, htf_sh: np.ndarray, htf_sl: np.ndarray, htf_idx: int,
                       ent_df: pd.DataFrame, ent_idx: int, threshold: int
@@ -494,8 +499,8 @@ def evaluate_bar_pair(htf_df: pd.DataFrame, htf_sh: np.ndarray, htf_sl: np.ndarr
 
     htf_trend = 1 if float(htf_row["ema20"]) > float(htf_row["ema50"]) else -1
     htf_closes = htf_df["Close"].to_numpy(dtype=float)
-    buy_bos  = _fresh_bos_bars_ago(htf_closes, htf_sh, htf_idx, "BUY")
-    sell_bos = _fresh_bos_bars_ago(htf_closes, htf_sl, htf_idx, "SELL")
+    buy_bos  = _fresh_bos_bars_ago(htf_closes, htf_sh, htf_sl, htf_idx, "BUY")
+    sell_bos = _fresh_bos_bars_ago(htf_closes, htf_sh, htf_sl, htf_idx, "SELL")
 
     sb = ss = 0
     if htf_trend == 1: sb += 15
