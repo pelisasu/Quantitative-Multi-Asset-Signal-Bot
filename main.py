@@ -1,4 +1,4 @@
-# bot.py  (fixed: yf-silenced, market_open gate, realistic backtest)
+# bot.py  (fixed v3: no double-log, weekend-aware staleness, market-closed backtest allowed)
 """
 ==============================================================================
 AUTO TRADING SIGNAL BOT
@@ -56,12 +56,13 @@ GLOBAL = {
     "cooldown_same_min":   60,
     "cooldown_flip_min":   120,
     "stale_max_min":       {"1m": 15, "5m": 30, "15m": 60, "1h": 180, "4h": 480},
-    "weekend_stale_extend_min": 3 * 24 * 60,   # 72h extra for exchange-closed assets
+    # staleness allowance when the underlying market is closed
+    "closed_stale_extra_min": 4 * 24 * 60,    # ~4 days
     "spike_z_threshold":   6.0,
     "no_signal_if_choppy": True,
     "spread_pts":   {"XAUUSD": 0.30, "NAS100": 1.5, "BTCUSD": 15.0, "ETHUSD": 1.0},
     "slippage_pts": {"XAUUSD": 0.10, "NAS100": 0.5, "BTCUSD":  5.0, "ETHUSD": 0.3},
-    "bt_risk_pct":        0.005,   # 0.5% risk per trade in backtest
+    "bt_risk_pct":        0.005,
     "bt_min_equity":      1000.0,
     "bt_max_dd_stop":     0.30,
     "bt_min_trades":      20,
@@ -136,7 +137,6 @@ def setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         stream=sys.stdout,
     )
-    # silence noisy third-party loggers (yfinance emits 404 as ERROR)
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("peewee").setLevel(logging.WARNING)
@@ -153,17 +153,6 @@ def _parse_ts(ts: str) -> datetime:
     except Exception:
         return now_utc()
 
-def is_weekend_zone(dt: datetime) -> bool:
-    """Fri 21:00 UTC – Mon 01:00 UTC: exchange-listed venues are closed."""
-    wd, hour = dt.weekday(), dt.hour
-    if wd == 4 and hour >= 21:  # Friday after US cash/fut close
-        return True
-    if wd in (5, 6):            # Saturday / Sunday
-        return True
-    if wd == 0 and hour < 1:    # Monday pre-open
-        return True
-    return False
-
 def market_open(inst: str) -> bool:
     """Return False for exchange-listed instruments outside cash/session hours."""
     kind = INSTRUMENTS[inst]["kind"]
@@ -178,11 +167,11 @@ def market_open(inst: str) -> bool:
 
     if kind == "commodity":
         # XAUUSD spot ~ Sun 22:00 UTC open – Fri 21:00 UTC close
-        if wd == 5:                       # Saturday
+        if wd == 5:                      # Saturday
             return False
-        if wd == 4 and hour >= 21:        # Friday after close
+        if wd == 4 and hour >= 21:       # Friday after close
             return False
-        if wd == 6 and hour < 22:         # Sunday before open
+        if wd == 6 and hour < 22:        # Sunday before open
             return False
         return True
 
@@ -212,7 +201,6 @@ def fetch_yf(symbol: str, interval: str, period: str, min_bars: int) -> Optional
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
         return df if len(df) >= min_bars else None
     except Exception:
-        # swallow — yfinance itself already logs; we already silenced its logger
         return None
 
 def fetch_coinbase(product: str, granularity: int) -> Optional[pd.DataFrame]:
@@ -237,6 +225,11 @@ def fetch_coinbase(product: str, granularity: int) -> Optional[pd.DataFrame]:
 
 def sanitize_df(df: pd.DataFrame, interval: str, min_bars: int,
                 instrument: str) -> Optional[pd.DataFrame]:
+    """
+    Reject stale data — but allow 'old' data when the market is CLOSED.
+    Rationale: on Monday pre-market, the most recent 1h bar for NAS100 is
+    Friday 20:00 UTC close. That is the legitimate last known price, not stale.
+    """
     if df is None or df.empty:
         return None
     last_ts = df.index[-1]
@@ -251,10 +244,9 @@ def sanitize_df(df: pd.DataFrame, interval: str, min_bars: int,
     age_min = (pd.Timestamp.now(tz="UTC") - last_ts).total_seconds() / 60.0
     limit   = GLOBAL["stale_max_min"].get(interval, 120)
 
-    # allow exchange-closed weekend data to pass (only for venue instruments)
-    kind = INSTRUMENTS[instrument]["kind"]
-    if kind != "crypto" and is_weekend_zone(now_utc()):
-        limit += GLOBAL["weekend_stale_extend_min"]
+    # lenient check when instrument market is currently closed
+    if not market_open(instrument):
+        limit = max(limit, GLOBAL["closed_stale_extra_min"])
 
     if age_min > limit:
         logging.info(f"[sanitize] {instrument} {interval} stale age={age_min:.0f}m > {limit}m")
@@ -386,12 +378,9 @@ def _wick_ok(candle: pd.Series) -> Tuple[bool, bool]:
            (upper / rng) < 0.55 and body_ratio > 0.25
 
 def evaluate_signal(instrument: str, mode: str) -> Optional[Dict[str, Any]]:
+    """Assumes caller already checked market_open. Session-hour filter applied here."""
     cfg = INSTRUMENTS[instrument]
     tf  = TIMEFRAMES[mode]
-
-    if not market_open(instrument):
-        logging.info(f"[market-closed] {instrument} {mode} - skip")
-        return None
 
     hour_utc = now_utc().hour
     if cfg["session_filter"] and mode == "SCALPING" and hour_utc not in cfg["session_hours"]:
@@ -618,14 +607,15 @@ def build_status_summary(conn: sqlite3.Connection) -> str:
         row = conn.execute(
             "SELECT ts,mode,direction,entry,score,regime FROM signals "
             "WHERE instrument=? ORDER BY id DESC LIMIT 1", (inst,)).fetchone()
+        open_flag = "" if market_open(inst) else " 🚫"
         if row:
             ts, mode, direction, entry, score, regime = row
             age_min = int((now_utc() - _parse_ts(ts)).total_seconds() / 60.0)
             mode_short = "SCALP" if mode == "SCALPING" else "SWING"
-            lines.append(f"• <b>{inst}</b> — {direction} ({mode_short}) @ {entry:.2f} | "
-                         f"skor {score} | {regime} | {age_min}m lalu")
+            lines.append(f"• <b>{inst}</b>{open_flag} — {direction} ({mode_short}) @ "
+                         f"{entry:.2f} | skor {score} | {regime} | {age_min}m lalu")
         else:
-            lines.append(f"• <b>{inst}</b> — belum ada sinyal")
+            lines.append(f"• <b>{inst}</b>{open_flag} — belum ada sinyal")
     lines.append(f"🕒 <code>{now_utc().strftime('%H:%M UTC')}</code>")
     return "\n".join(lines)
 
@@ -871,8 +861,12 @@ def main() -> None:
         db_init(conn)
         handle_telegram_commands(conn)
 
-        for mode in ["SCALPING", "SWING"]:
-            for inst in INSTRUMENTS.keys():
+        # per-instrument gate: one log for market closed; no double "no-signal"
+        for inst in INSTRUMENTS.keys():
+            if not market_open(inst):
+                logging.info(f"[market-closed] {inst} (all modes skip)")
+                continue
+            for mode in ["SCALPING", "SWING"]:
                 try:
                     sig = evaluate_signal(inst, mode)
                 except Exception as e:
