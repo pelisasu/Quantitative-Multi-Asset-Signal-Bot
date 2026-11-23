@@ -1,0 +1,71 @@
+# .github/workflows/signal_bot.yml
+name: Trading Signal Bot
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trading-signal-bot
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore persistent state (DB + chart)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          key: trading-state-${{ github.run_id }}
+          restore-keys: |
+            trading-state-
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python main.py
+
+      - name: Save persistent state (DB + chart)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          key: trading-state-${{ github.run_id }}
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-outputs-${{ github.run_id }}
+          path: |
+            trading_signals.db
+            backtest_performance.png
+          if-no-files-found: ignore
+          retention-days: 7
