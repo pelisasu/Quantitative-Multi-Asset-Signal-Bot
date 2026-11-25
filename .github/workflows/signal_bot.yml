@@ -55,7 +55,7 @@ jobs:
           BOT_BALANCE: ${{ secrets.BOT_BALANCE || '10000.0' }}
         run: |
           MODE="${{ github.event.inputs.mode || 'live' }}"
-          python main.py --mode "$MODE"
+          python bot.py --mode "$MODE"
 
       - name: Persist SQLite State & Calibrated Params
         if: always()
