@@ -1466,13 +1466,23 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
         ent_dts      = [ts.to_pydatetime() for ts in df_ent.index]
         n_ent = len(df_ent)
         usable = n_ent - 80
-        # 4-Quarter Anchored Walk-Forward (IS starts at 50% to stabilize parameter estimation)
-        folds = [
-            (80 + int(usable * 0.500), 80 + int(usable * 0.625)),
-            (80 + int(usable * 0.625), 80 + int(usable * 0.750)),
-            (80 + int(usable * 0.750), 80 + int(usable * 0.875)),
-            (80 + int(usable * 0.875), n_ent),
-        ]
+        # Adaptive Anchored Walk-Forward:
+        # 4 OOS quarters for deep multi-month datasets (>=5500 bars),
+        # 2 OOS halves for ~59d 15m scalping datasets so each OOS fold holds meaningful trades.
+        if n_ent >= 5500:
+            folds = [
+                (80 + int(usable * 0.500), 80 + int(usable * 0.625)),
+                (80 + int(usable * 0.625), 80 + int(usable * 0.750)),
+                (80 + int(usable * 0.750), 80 + int(usable * 0.875)),
+                (80 + int(usable * 0.875), n_ent),
+            ]
+            min_passes_req = 2
+        else:
+            folds = [
+                (80 + int(usable * 0.500), 80 + int(usable * 0.750)),
+                (80 + int(usable * 0.750), n_ent),
+            ]
+            min_passes_req = 1
 
         sig_caches = {
             th: precompute_signals_for_threshold(htf_a, htf_sh, htf_sl, htf_close_ts, ent_a, ent_close_ts, ent_dts, inst, mode, th)
@@ -1498,7 +1508,7 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
             latest_pick = (th, slm, tpm)
             oos_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=1, start_idx=is_end, end_idx=oos_end)
             stitched_oos_r.extend(oos_r["trades_r"])
-            if oos_r["trades"] >= 2 and oos_r["profit_factor"] >= 0.95 and oos_r["max_dd"] <= 0.25:
+            if oos_r["trades"] >= 2 and oos_r["profit_factor"] >= 0.98 and oos_r["max_dd"] <= 0.25:
                 oos_passes += 1
 
         oos_gw = sum(r for r in stitched_oos_r if r > 0)
@@ -1508,9 +1518,11 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
         th, slm, tpm = latest_pick
         full_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=8, start_idx=80, end_idx=n_ent)
         mc_prob = monte_carlo_prob_profit(full_r["trades_r"], runs=int(GLOBAL["mc_runs"]), risk_frac=float(GLOBAL["bt_risk_pct"]))
+        n_folds = len(folds)
         enabled = (
-            (oos_passes >= 2)
-            and (stitched_oos_pf >= 1.05)
+            (oos_passes >= min_passes_req)
+            and (len(stitched_oos_r) >= 4)
+            and (stitched_oos_pf >= 1.02)
             and (full_r["trades"] >= 8)
             and (full_r["profit_factor"] >= float(GLOBAL["bt_min_profit_factor"]))
             and (mc_prob >= float(GLOBAL["mc_min_prob_profit"]))
@@ -1518,7 +1530,7 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
 
         calibrated[f"{inst}:{mode}"] = {
             "enabled": enabled,
-            "reason": "passed_4q_wf_stitched_oos_and_mc" if enabled else f"failed_wf(folds={oos_passes}/4,oos_pf={stitched_oos_pf:.2f},pf={full_r['profit_factor']:.2f},mc={mc_prob:.0%})",
+            "reason": f"passed_{n_folds}f_wf_stitched_oos_and_mc" if enabled else f"failed_wf(folds={oos_passes}/{n_folds},oos_pf={stitched_oos_pf:.2f},pf={full_r['profit_factor']:.2f},mc={mc_prob:.0%})",
             "sl_mult": slm, "tp_mult": tpm, "trail_mult": tf["trail_atr"], "threshold": th,
             "oos_pf": round(stitched_oos_pf, 2),
             "full_pf": round(full_r["profit_factor"], 2), "sqn": round(full_r["sqn"], 2),
@@ -1528,20 +1540,20 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
         if enabled:
             curves[inst] = full_r["equity_curve"]
             logging.info(
-                f"[cal-v4] {inst} {mode} ENABLED folds={oos_passes}/4 oos_PF={stitched_oos_pf:.2f} th={th} sl={slm} tp={tpm} "
+                f"[cal-v4] {inst} {mode} ENABLED folds={oos_passes}/{n_folds} oos_PF={stitched_oos_pf:.2f} th={th} sl={slm} tp={tpm} "
                 f"trades={full_r['trades']} PF={full_r['profit_factor']:.2f} WR={full_r['winrate']:.1%} "
                 f"SQN={full_r['sqn']:.2f} MDD={full_r['max_dd']:.1%} MC={mc_prob:.0%}"
             )
             summary_lines.append(
-                f"• <b>{inst}</b> ✅ {oos_passes}/4 Q | OOS PF <code>{stitched_oos_pf:.2f}</code> | Full PF <code>{full_r['profit_factor']:.2f}</code> | SQN <code>{full_r['sqn']:.2f}</code> | MC <code>{mc_prob:.0%}</code>"
+                f"• <b>{inst}</b> ✅ {oos_passes}/{n_folds} F | OOS PF <code>{stitched_oos_pf:.2f}</code> | Full PF <code>{full_r['profit_factor']:.2f}</code> | SQN <code>{full_r['sqn']:.2f}</code> | MC <code>{mc_prob:.0%}</code>"
             )
         else:
             logging.info(
-                f"[cal-v4-skip] {inst} {mode} DISABLED folds={oos_passes}/4 oos_PF={stitched_oos_pf:.2f} th={th} sl={slm} tp={tpm} "
+                f"[cal-v4-skip] {inst} {mode} DISABLED folds={oos_passes}/{n_folds} oos_PF={stitched_oos_pf:.2f} th={th} sl={slm} tp={tpm} "
                 f"trades={full_r['trades']} PF={full_r['profit_factor']:.2f} SQN={full_r['sqn']:.2f} MC={mc_prob:.0%}"
             )
             summary_lines.append(
-                f"• <b>{inst}</b> ⛔ off ({oos_passes}/4 Q, OOS PF {stitched_oos_pf:.2f}, Full PF {full_r['profit_factor']:.2f}, MC {mc_prob:.0%})"
+                f"• <b>{inst}</b> ⛔ off ({oos_passes}/{n_folds} F, OOS PF {stitched_oos_pf:.2f}, Full PF {full_r['profit_factor']:.2f}, MC {mc_prob:.0%})"
             )
 
     with open(PARAMS_PATH, "w", encoding="utf-8") as f:
