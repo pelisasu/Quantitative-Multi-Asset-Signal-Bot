@@ -15,29 +15,23 @@
     "tp_mult": 5.0,
     "trail_mult": 1.5,
     "threshold": 65,
-    "is_pf": 1.53,
+    "is_pf": 1.31,
     "oos_pf": 1.35,
-    "updated_at": "2026-11-23T12:39:10Z"
+    "updated_at": "2026-11-25T05:17:53Z"
   },
   "ETHUSD:SWING": {
-    "enabled": true,
-    "sl_mult": 1.8,
-    "tp_mult": 5.0,
-    "trail_mult": 1.5,
-    "threshold": 68,
-    "is_pf": 1.16,
-    "oos_pf": 11.48,
-    "updated_at": "2026-11-23T12:39:56Z"
+    "enabled": false,
+    "reason": "failed_oos_walk_forward",
+    "best_is_pf": 0.97,
+    "oos_pf": 2.01,
+    "updated_at": "2026-11-25T05:18:52Z"
   },
   "NAS100:SCALPING": {
-    "enabled": true,
-    "sl_mult": 2.4,
-    "tp_mult": 4.2,
-    "trail_mult": 1.2,
-    "threshold": 68,
-    "is_pf": 1.89,
-    "oos_pf": 1.83,
-    "updated_at": "2026-11-23T12:41:04Z"
+    "enabled": false,
+    "reason": "failed_oos_walk_forward",
+    "best_is_pf": 1.68,
+    "oos_pf": 1.09,
+    "updated_at": "2026-11-25T05:20:45Z"
   },
   "NAS100:SWING": {
     "enabled": true,
@@ -52,22 +46,22 @@
   "XAUUSD:SCALPING": {
     "enabled": false,
     "reason": "failed_oos_walk_forward",
-    "best_is_pf": 0.71,
-    "oos_pf": 1.25,
-    "updated_at": "2026-11-23T12:40:37Z"
+    "best_is_pf": 0.75,
+    "oos_pf": 0.57,
+    "updated_at": "2026-11-25T05:19:58Z"
   },
   "BTCUSD:SCALPING": {
     "enabled": false,
     "reason": "failed_oos_walk_forward",
-    "best_is_pf": 0.79,
-    "oos_pf": 0.57,
-    "updated_at": "2026-11-23T12:41:59Z"
+    "best_is_pf": 0.91,
+    "oos_pf": 0.77,
+    "updated_at": "2026-11-25T05:22:04Z"
   },
   "ETHUSD:SCALPING": {
     "enabled": false,
     "reason": "failed_oos_walk_forward",
-    "best_is_pf": 0.3,
-    "oos_pf": 2.85,
-    "updated_at": "2026-11-23T12:42:55Z"
+    "best_is_pf": 0.55,
+    "oos_pf": 0.71,
+    "updated_at": "2026-11-25T05:23:25Z"
   }
 }
