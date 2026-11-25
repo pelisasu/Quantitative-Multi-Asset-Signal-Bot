@@ -2,100 +2,69 @@ name: Quantitative Multi-Asset Signal Bot
 
 on:
   schedule:
-    # Berjalan rapat setiap 5 menit (waktu UTC)
+    # Live scan + /check polling setiap 5 menit
     - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "Mode evaluasi sinyal"
-        required: false
-        default: "ALL"
+        description: "Execution mode (live | backtest | both | check)"
+        required: true
+        default: "live"
         type: choice
         options:
-          - ALL
-          - SCALPING
-          - SWING
-      force_backtest:
-        description: "Regenerasi grafik backtest_performance.png"
-        required: false
-        default: false
-        type: boolean
-      force_optimize:
-        description: "Jalankan ulang grid-search parameter"
-        required: false
-        default: false
-        type: boolean
-      force_check:
-        description: "Kirim ringkasan status 4 instrumen ke Telegram"
-        required: false
-        default: false
-        type: boolean
+          - live
+          - backtest
+          - both
+          - check
 
 concurrency:
-  group: trading-signal-bot-state
+  # Mencegah race condition pada SQLite saat cron berjalan bersamaan
+  group: quant-signal-bot-state
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
-  run-signal-bot:
+  run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Setup Python 3.11
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore SQLite State & Backtest Chart
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            trading_signals.db
-            trading_signals.db-wal
-            trading_signals.db-shm
-            backtest_performance.png
-          key: signal-bot-state-${{ github.run_id }}
-          restore-keys: |
-            signal-bot-state-
-
-      - name: Execute Signal Bot
+      - name: Run Quantitative Signal Bot
         env:
-          TZ: UTC
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          RUN_MODE_FILTER: ${{ github.event.inputs.mode || 'ALL' }}
-          FORCE_BACKTEST: ${{ github.event.inputs.force_backtest || 'false' }}
-          FORCE_OPTIMIZE: ${{ github.event.inputs.force_optimize || 'false' }}
-          FORCE_CHECK: ${{ github.event.inputs.force_check || 'false' }}
-        run: python bot.py
+          BOT_BALANCE: ${{ secrets.BOT_BALANCE || '10000.0' }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'live' }}"
+          python main.py --mode "$MODE"
 
-      - name: Save SQLite State & Backtest Chart
+      - name: Persist SQLite State & Calibrated Params
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            trading_signals.db
-            trading_signals.db-wal
-            trading_signals.db-shm
-            backtest_performance.png
-          key: signal-bot-state-${{ github.run_id }}
-
-      - name: Upload Artifacts (DB & Performance Chart)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-state-${{ github.run_id }}
-          path: |
-            trading_signals.db
-            backtest_performance.png
-          retention-days: 14
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f trading_signals.db calibrated_params.json backtest_performance_v3.png 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(state): update signals db & params [skip ci]"
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push
+          fi
