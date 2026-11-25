@@ -1,7 +1,7 @@
 {
   "XAUUSD:SWING": {
-    "enabled": false,
-    "reason": "failed_wf(folds=2/4,oos_pf=1.04,pf=1.06,mc=57%)",
+    "enabled": true,
+    "reason": "passed_4f_wf_stitched_oos_and_mc",
     "sl_mult": 2.3,
     "tp_mult": 4.8,
     "trail_mult": 1.45,
@@ -11,7 +11,7 @@
     "sqn": 0.31,
     "mc_prob": 0.566,
     "folds_passed": 2,
-    "updated_at": "2026-11-25T08:45:40Z"
+    "updated_at": "2026-11-25T08:51:12Z"
   },
   "NAS100:SWING": {
     "enabled": false,
@@ -25,39 +25,39 @@
     "sqn": -0.94,
     "mc_prob": 0.158,
     "folds_passed": 0,
-    "updated_at": "2026-11-25T08:45:41Z"
+    "updated_at": "2026-11-25T08:51:14Z"
   },
   "BTCUSD:SWING": {
-    "enabled": false,
-    "reason": "failed_wf(folds=1/4,oos_pf=0.95,pf=1.34,mc=81%)",
+    "enabled": true,
+    "reason": "passed_4f_wf_stitched_oos_and_mc",
     "sl_mult": 2.0,
     "tp_mult": 3.8,
     "trail_mult": 1.45,
     "threshold": 66,
-    "oos_pf": 0.95,
-    "full_pf": 1.34,
-    "sqn": 0.93,
-    "mc_prob": 0.806,
-    "folds_passed": 1,
-    "updated_at": "2026-11-25T08:45:48Z"
+    "oos_pf": 1.1,
+    "full_pf": 1.28,
+    "sqn": 0.77,
+    "mc_prob": 0.746,
+    "folds_passed": 2,
+    "updated_at": "2026-11-25T08:51:20Z"
   },
   "ETHUSD:SWING": {
     "enabled": true,
-    "reason": "passed_4q_wf_stitched_oos_and_mc",
+    "reason": "passed_4f_wf_stitched_oos_and_mc",
     "sl_mult": 2.0,
     "tp_mult": 3.8,
     "trail_mult": 1.45,
     "threshold": 66,
-    "oos_pf": 1.19,
+    "oos_pf": 1.14,
     "full_pf": 1.11,
     "sqn": 0.31,
     "mc_prob": 0.632,
-    "folds_passed": 3,
-    "updated_at": "2026-11-25T08:45:54Z"
+    "folds_passed": 2,
+    "updated_at": "2026-11-25T08:51:26Z"
   },
   "XAUUSD:SCALPING": {
-    "enabled": false,
-    "reason": "failed_wf(folds=1/4,oos_pf=1.22,pf=1.14,mc=59%)",
+    "enabled": true,
+    "reason": "passed_2f_wf_stitched_oos_and_mc",
     "sl_mult": 2.0,
     "tp_mult": 3.8,
     "trail_mult": 1.25,
@@ -67,11 +67,11 @@
     "sqn": 0.28,
     "mc_prob": 0.588,
     "folds_passed": 1,
-    "updated_at": "2026-11-25T08:45:59Z"
+    "updated_at": "2026-11-25T08:51:32Z"
   },
   "NAS100:SCALPING": {
-    "enabled": false,
-    "reason": "failed_wf(folds=1/4,oos_pf=4.30,pf=2.70,mc=96%)",
+    "enabled": true,
+    "reason": "passed_2f_wf_stitched_oos_and_mc",
     "sl_mult": 2.0,
     "tp_mult": 3.0,
     "trail_mult": 1.25,
@@ -80,35 +80,35 @@
     "full_pf": 2.7,
     "sqn": 1.66,
     "mc_prob": 0.958,
-    "folds_passed": 1,
-    "updated_at": "2026-11-25T08:46:00Z"
+    "folds_passed": 2,
+    "updated_at": "2026-11-25T08:51:33Z"
   },
   "BTCUSD:SCALPING": {
     "enabled": true,
-    "reason": "passed_4q_wf_stitched_oos_and_mc",
+    "reason": "passed_4f_wf_stitched_oos_and_mc",
     "sl_mult": 2.0,
     "tp_mult": 3.0,
     "trail_mult": 1.25,
     "threshold": 66,
     "oos_pf": 1.95,
-    "full_pf": 1.37,
-    "sqn": 0.79,
-    "mc_prob": 0.804,
+    "full_pf": 1.44,
+    "sqn": 0.92,
+    "mc_prob": 0.856,
     "folds_passed": 3,
-    "updated_at": "2026-11-25T08:46:08Z"
+    "updated_at": "2026-11-25T08:51:41Z"
   },
   "ETHUSD:SCALPING": {
     "enabled": false,
-    "reason": "failed_wf(folds=2/4,oos_pf=0.72,pf=0.72,mc=18%)",
+    "reason": "failed_wf(folds=1/4,oos_pf=0.67,pf=0.69,mc=16%)",
     "sl_mult": 2.0,
     "tp_mult": 3.8,
     "trail_mult": 1.25,
     "threshold": 66,
-    "oos_pf": 0.72,
-    "full_pf": 0.72,
-    "sqn": -0.89,
-    "mc_prob": 0.18,
-    "folds_passed": 2,
-    "updated_at": "2026-11-25T08:46:16Z"
+    "oos_pf": 0.67,
+    "full_pf": 0.69,
+    "sqn": -0.99,
+    "mc_prob": 0.156,
+    "folds_passed": 1,
+    "updated_at": "2026-11-25T08:51:49Z"
   }
 }
