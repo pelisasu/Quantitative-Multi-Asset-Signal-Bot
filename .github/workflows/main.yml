@@ -1,69 +1,112 @@
-name: Quant Signal Bot v2
+name: QuantPulse Signal Bot v4.0
 
 on:
   schedule:
-    # Live lightweight scan every 15 minutes
-    - cron: "*/15 * * * *"
-    # Weekly walk-forward calibration every Sunday at 00:05 UTC
-    - cron: "5 0 * * 0"
+    # Live scan & open-trade monitor every 15 minutes (aligned with 15m/1h/4h bars)
+    - cron: '*/15 * * * *'
+    # Weekly 3-Fold Walk-Forward + Monte Carlo recalibration (Sunday 02:00 UTC)
+    - cron: '0 2 * * 0'
+
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode (live | backtest | both)"
+        description: 'Execution mode'
         required: true
-        default: "live"
+        default: 'live'
+        type: choice
+        options:
+          - live
+          - backtest
+          - both
+          - check
+
+concurrency:
+  group: quantpulse-bot-v4
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
-concurrency:
-  group: quant-signal-bot-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  run-bot:
+  run-signal-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          python-version: "3.11"
+          fetch-depth: 1
 
-      - name: Install dependencies
-        run: pip install numpy pandas requests yfinance matplotlib
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Run Signal Bot v2
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-signal-bot-v4
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas yfinance requests matplotlib
+
+      - name: Syntax check signal_bot_v4.py
+        run: python -m py_compile signal_bot_v4.py
+
+      - name: Run Signal Bot v4.0
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          BOT_BALANCE: ${{ vars.BOT_BALANCE || '10000.0' }}
+          BOT_RISK_SCALP: ${{ vars.BOT_RISK_SCALP || '0.50' }}
+          BOT_RISK_SWING: ${{ vars.BOT_RISK_SWING || '0.75' }}
+          BOT_MAX_BUCKET_RISK: ${{ vars.BOT_MAX_BUCKET_RISK || '1.00' }}
+          BOT_DB_PATH: trading_signals_v4.db
+          BOT_PARAMS_PATH: calibrated_params_v4.json
+          BOT_CHART_PATH: backtest_performance_v4.png
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            python bot_hardened.py --mode "${{ github.event.inputs.mode }}"
-          elif [ "${{ github.event.schedule }}" = "5 0 * * 0" ]; then
-            python bot_hardened.py --mode backtest
+            MODE="${{ inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "0 2 * * 0" ]; then
+            MODE="both"
           else
-            python bot_hardened.py --mode live
+            MODE="live"
           fi
+          echo "Running signal_bot_v4.py with --mode $MODE"
+          python signal_bot_v4.py --mode "$MODE"
 
-      - name: Persist SQLite state & calibrated params
+      - name: Upload calibration artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantpulse-v4-reports
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            calibrated_params_v4.json
+            backtest_performance_v4.png
+
+      - name: Persist bot state (SQLite DB & calibrated params)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add trading_signals.db calibrated_params.json backtest_performance_v2.png || true
-          if git diff --staged --quiet; then
-            echo "No state or calibration changes to commit."
-            exit 0
-          fi
-
-          git commit -m "chore: update signal state & calibration"
-
-          BRANCH="${{ github.ref_name }}"
-          for i in 1 2 3; do
-            git pull --rebase -X theirs origin "$BRANCH" && git push origin "$BRANCH" && exit 0
-            echo "Push race detected, retrying ($i/3)..."
-            sleep 2
+          for f in trading_signals_v4.db calibrated_params_v4.json backtest_performance_v4.png; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            fi
           done
-          exit 1
+
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(bot-v4): update signal state & calibration [skip ci]"
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push
+          else
+            echo "No state changes to commit."
+          fi
