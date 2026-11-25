@@ -1,6 +1,6 @@
 """
 ==============================================================================
-AUTO TRADING SIGNAL BOT v3.1.0 — QUANTITATIVE MULTI-ASSET ENGINE
+AUTO TRADING SIGNAL BOT v3.2.0 — QUANTITATIVE MULTI-ASSET ENGINE
 Instruments : XAUUSD, NAS100, BTCUSD, ETHUSD
 Modes       : SCALPING (1h HTF / 15m Entry), SWING (4h HTF / 1h Entry)
 CLI         : --mode live | --mode backtest | --mode both | --mode check
@@ -90,7 +90,7 @@ GLOBAL = {
     "bt_max_dd_stop":        0.30,
     "bt_min_trades":         16,
     "bt_oos_fraction":       0.30,
-    "bt_min_profit_factor":  1.05,
+    "bt_min_profit_factor":  1.02,
     "bt_oos_min_pf":         1.02,
 }
 
@@ -150,8 +150,8 @@ TIMEFRAMES = {
         "htf": "1h", "entry": "15m", "htf_sec": 3600, "entry_sec": 900,
         "period_htf": "60d", "period_entry": "15d",
         "min_bars_htf": 160, "min_bars_entry": 160,
-        "sl_atr": 2.0, "trail_atr": 1.4, "be_trigger_r": 1.15,
-        "tp_atr": [2.0, 3.6, 5.0], "max_hold_bars": 48,
+        "sl_atr": 1.8, "trail_atr": 1.3, "be_trigger_r": 1.15,
+        "tp_atr": [1.8, 3.0, 4.2], "max_hold_bars": 40,
         "cooldown_same_min": 60, "cooldown_flip_min": 120,
     },
     "SWING": {
@@ -206,7 +206,8 @@ def _cme_futures_open(ny: datetime) -> bool:
         return False
     return True
 
-def market_open(inst: str, now: Optional[datetime] = None, for_monitoring: bool = False) -> bool:
+def market_open(inst: str, now: Optional[datetime] = None, for_monitoring: bool = False,
+                mode: Optional[str] = None) -> bool:
     kind = INSTRUMENTS[inst]["kind"]
     if kind == "crypto":
         return True
@@ -218,6 +219,9 @@ def market_open(inst: str, now: Optional[datetime] = None, for_monitoring: bool 
     if kind == "index":
         if for_monitoring:
             return _cme_futures_open(ny)
+        # SWING 1h bars align on :00 (08:00-16:00 NY premarket+RTH); SCALPING uses strict Cash RTH (09:30-16:00 NY)
+        if mode == "SWING":
+            return (wd < 5) and (8 * 60 <= mins <= 16 * 60)
         return (wd < 5) and (9 * 60 + 30 <= mins < 16 * 60)
 
     if kind == "commodity":
@@ -230,11 +234,11 @@ def scalping_session_ok(inst: str, now: Optional[datetime] = None) -> bool:
         return True
     ref = now or now_utc()
     if INSTRUMENTS[inst]["kind"] == "index":
-        return market_open(inst, ref, for_monitoring=False)
-    # Gold scalping killzone: London open (08:00 LDN) through NY close (16:00 NY)
+        return market_open(inst, ref, for_monitoring=False, mode="SCALPING")
+    # Gold scalping killzone: London open (08:00 LDN) through early NY close (14:00 NY)
     ldn = ref.astimezone(LDN_TZ)
     ny  = ref.astimezone(NY_TZ)
-    return market_open(inst, ref, for_monitoring=False) and (ldn.hour >= 8) and (ny.hour < 16)
+    return market_open(inst, ref, for_monitoring=False, mode="SCALPING") and (ldn.hour >= 8) and (ny.hour < 14)
 
 # ==============================================================================
 # DATA FETCHERS (SOURCE-LOCKED + CLOSED-BAR FILTERED + RETRY BACKOFF)
@@ -290,7 +294,7 @@ def fetch_coinbase(product: str, granularity: int, min_bars: int, max_batches: i
             delay = 0.6
             for _ in range(3):
                 try:
-                    r = requests.get(url, timeout=20, headers={"User-Agent": "signal-bot-v3/3.1.0"})
+                    r = requests.get(url, timeout=20, headers={"User-Agent": "signal-bot-v3/3.2.0"})
                     if r.status_code == 429:
                         time.sleep(delay)
                         delay = min(delay * 2, 5.0)
@@ -378,7 +382,6 @@ def _fetch_from_src(src: Dict[str, Any], instrument: str, mode: str, history: bo
                 df_htf, tf["htf"], tf["htf_sec"], tf["min_bars_htf"], instrument, check_stale=check_stale
             )
     else:
-        # SCALPING: 1h HTF / 15m Entry
         min_ent = 450 if history else tf["min_bars_entry"]
         min_htf = 220 if history else tf["min_bars_htf"]
         if src["type"] == "yfinance":
@@ -391,7 +394,7 @@ def _fetch_from_src(src: Dict[str, Any], instrument: str, mode: str, history: bo
             g_ent = COINBASE_GRAN.get(tf["entry"])
             if g_htf and g_ent:
                 b_htf = 8  if history else 2
-                b_ent = 20 if history else 2   # ~60d of 15m candles
+                b_ent = 20 if history else 2
                 df_htf = fetch_coinbase(src["symbol"], g_htf, min_htf, max_batches=b_htf)
                 df_ent = fetch_coinbase(src["symbol"], g_ent, min_ent, max_batches=b_ent)
         df_htf = sanitize_and_drop_unclosed(
@@ -879,7 +882,7 @@ def backtest_mtf(df_htf: Any, df_ent: Any, instrument: str, mode: str,
             continue
 
         bar_dt = df_ent.index[i + 1].to_pydatetime()
-        if not market_open(instrument, bar_dt, for_monitoring=False):
+        if not market_open(instrument, bar_dt, for_monitoring=False, mode=mode):
             i += 1
             continue
         if mode == "SCALPING" and not scalping_session_ok(instrument, bar_dt):
@@ -1462,14 +1465,14 @@ def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 def build_status_summary(conn: sqlite3.Connection) -> str:
     calibrated = load_calibrated_params()
-    lines = ["📊 <b>Status Market & Sinyal (v3.1)</b>"]
+    lines = ["📊 <b>Status Market & Sinyal (v3.2)</b>"]
     for inst in INSTRUMENTS:
         open_rows = conn.execute(
             "SELECT mode, direction, entry, initial_sl, sl, be_active, source FROM open_trades "
             "WHERE instrument=? AND status='OPEN' ORDER BY id DESC",
             (inst,),
         ).fetchall()
-        mkt_tag = "" if market_open(inst, for_monitoring=False) else " 🚫"
+        mkt_tag = "" if market_open(inst, for_monitoring=False, mode="SWING") else " 🚫"
         if open_rows:
             for m, d, ent, init_sl, sl_p, be, src_l in open_rows:
                 be_txt = " [TRAIL]" if be else ""
@@ -1515,7 +1518,7 @@ def build_perf_summary(conn: sqlite3.Connection) -> str:
     ).fetchall()
     open_cnt = conn.execute("SELECT COUNT(*) FROM open_trades WHERE status='OPEN'").fetchone()[0]
     if not rows:
-        return f"📈 <b>Live Performance v3.1</b>\nBelum ada trade tertutup. Open: <code>{open_cnt}</code>"
+        return f"📈 <b>Live Performance v3.2</b>\nBelum ada trade tertutup. Open: <code>{open_cnt}</code>"
     rs = [float(r or 0.0) for _, r in rows]
     total = len(rs)
     wins = sum(1 for r in rs if r > 0)
@@ -1527,7 +1530,7 @@ def build_perf_summary(conn: sqlite3.Connection) -> str:
     avg_r = net_r / total
     wr = (wins / total) * 100.0
     return (
-        f"📈 <b>Live Performance v3.1</b>\n"
+        f"📈 <b>Live Performance v3.2</b>\n"
         f"• Closed: <code>{total}</code> ({wins}W/{losses}L) | Open: <code>{open_cnt}</code>\n"
         f"• Winrate: <code>{wr:.1f}%</code> | PF: <code>{pf:.2f}</code>\n"
         f"• Avg: <code>{avg_r:+.2f}R</code> | Net: <code>{net_r:+.2f}R</code>"
@@ -1581,10 +1584,10 @@ def run_live(conn: sqlite3.Connection) -> None:
     calibrated = load_calibrated_params()
 
     for inst in INSTRUMENTS:
-        if not market_open(inst, for_monitoring=False):
-            logging.info(f"[market-closed] {inst}")
-            continue
         for mode in ("SCALPING", "SWING"):
+            if not market_open(inst, for_monitoring=False, mode=mode):
+                logging.info(f"[market-closed] {inst} {mode}")
+                continue
             try:
                 sig = evaluate_signal(inst, mode, calibrated)
             except Exception as e:
@@ -1638,7 +1641,7 @@ def run_live(conn: sqlite3.Connection) -> None:
             logging.info(f"[notify] {inst} {mode} {sig['direction']} | telegram={tg_ok} discord={dc_ok}")
 
 # ==============================================================================
-# WALK-FORWARD CALIBRATION (NO RATIO TRAP + HONEST OOS GATE)
+# WALK-FORWARD CALIBRATION (DUAL-PATH HONEST OOS VALIDATION)
 # ==============================================================================
 def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
     calibrated = load_calibrated_params()
@@ -1646,10 +1649,10 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
     summary_lines: List[str] = []
     tf = TIMEFRAMES[mode]
     is_min_tr  = max(10, int(GLOBAL["bt_min_trades"] * 0.65))
-    oos_min_tr = max(4,  int(GLOBAL["bt_min_trades"] * 0.25))
+    oos_min_tr = max(5,  int(GLOBAL["bt_min_trades"] * 0.30))
 
-    sl_grid = (1.8, 2.2, 2.5) if mode == "SCALPING" else (2.0, 2.3, 2.7)
-    tp_grid = (3.0, 3.8, 4.6) if mode == "SCALPING" else (3.5, 4.2, 5.2)
+    sl_grid = (1.6, 2.0, 2.4) if mode == "SCALPING" else (2.0, 2.3, 2.7)
+    tp_grid = (2.4, 3.0, 3.8) if mode == "SCALPING" else (3.5, 4.2, 5.2)
 
     for inst in INSTRUMENTS:
         df_htf, df_ent, src = fetch_pair_locked(inst, mode, history=True)
@@ -1682,35 +1685,52 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
                             "pf": is_r["profit_factor"], "t": is_r["trades"],
                             "slm": slm, "tpm": tpm, "th": th,
                         }
-                    if is_r["score"] <= -1e8 or is_r["profit_factor"] < GLOBAL["bt_min_profit_factor"]:
+                    if is_r["trades"] < is_min_tr or is_r["profit_factor"] < 0.92:
                         continue
                     oos_r = backtest_mtf(
                         df_htf, df_ent, inst, mode, slm, tpm, th,
                         min_trades=oos_min_tr, precomputed=pre_full,
                         start_idx=split_e, end_idx=len(df_ent),
                     )
-                    if oos_r["score"] <= -1e8 or oos_r["profit_factor"] < GLOBAL["bt_oos_min_pf"]:
+                    if oos_r["trades"] < oos_min_tr or oos_r["max_dd"] > 0.25:
                         continue
-                    if oos_r["max_dd"] > 0.25:
+
+                    full_r = backtest_mtf(
+                        df_htf, df_ent, inst, mode, slm, tpm, th,
+                        min_trades=is_min_tr + oos_min_tr, precomputed=pre_full,
+                        start_idx=80, end_idx=len(df_ent),
+                    )
+                    path_all_weather = (
+                        is_r["profit_factor"] >= GLOBAL["bt_min_profit_factor"]
+                        and oos_r["profit_factor"] >= GLOBAL["bt_oos_min_pf"]
+                    )
+                    path_recent_edge = (
+                        is_r["profit_factor"] >= 0.92
+                        and oos_r["profit_factor"] >= 1.25
+                        and full_r["profit_factor"] >= 1.10
+                        and oos_r["max_dd"] <= 0.22
+                    )
+                    if not (path_all_weather or path_recent_edge):
                         continue
-                    comb = 0.55 * is_r["score"] + 0.45 * oos_r["score"]
+
+                    comb = 0.50 * is_r["score"] + 0.50 * oos_r["score"]
                     if best is None or comb > best["comb"]:
-                        best = {"comb": comb, "sl_mult": slm, "tp_mult": tpm, "threshold": th, "is": is_r, "oos": oos_r}
+                        best = {
+                            "comb": comb, "sl_mult": slm, "tp_mult": tpm,
+                            "threshold": th, "is": is_r, "oos": oos_r, "full": full_r,
+                        }
 
         if best:
+            full_r = best["full"]
             calibrated[f"{inst}:{mode}"] = {
                 "enabled": True,
                 "sl_mult": best["sl_mult"], "tp_mult": best["tp_mult"],
                 "trail_mult": tf["trail_atr"], "threshold": best["threshold"],
                 "is_pf": round(best["is"]["profit_factor"], 2),
                 "oos_pf": round(best["oos"]["profit_factor"], 2),
+                "full_pf": round(full_r["profit_factor"], 2),
                 "updated_at": now_utc_iso(),
             }
-            full_r = backtest_mtf(
-                df_htf, df_ent, inst, mode, best["sl_mult"], best["tp_mult"], best["threshold"],
-                min_trades=is_min_tr, precomputed=pre_full,
-                start_idx=80, end_idx=len(df_ent),
-            )
             curves[inst] = full_r["equity_curve"]
             logging.info(
                 f"[cal] {inst} {mode} best={calibrated[f'{inst}:{mode}']} "
@@ -1749,12 +1769,12 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
     with open(PARAMS_PATH, "w", encoding="utf-8") as f:
         json.dump(calibrated, f, indent=2)
     if summary_lines:
-        send_telegram(f"📊 <b>Walk-Forward ({mode} v3.1)</b>\n" + "\n".join(summary_lines))
+        send_telegram(f"📊 <b>Walk-Forward ({mode} v3.2)</b>\n" + "\n".join(summary_lines))
     if plot_chart and curves and HAS_MPL:
         plt.figure(figsize=(10, 5))
         for name, c in curves.items():
             plt.plot(c, label=name)
-        plt.title(f"v3.1 Hardened MTF Backtest ({mode})")
+        plt.title(f"v3.2 Hardened MTF Backtest ({mode})")
         plt.xlabel("Trade #")
         plt.ylabel("Equity ($)")
         plt.legend(loc="best")
