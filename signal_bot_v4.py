@@ -517,6 +517,10 @@ def fetch_pair_locked(instrument: str, mode: str, history: bool = False,
         matched = [g for g in groups if g["name"] == pref_name]
         if matched:
             groups = matched
+    elif history:
+        # Use deepest multi-year history (yfinance/coinbase) for walk-forward calibration,
+        # while keeping TwelveData primary for low-latency live signal evaluation.
+        groups = sorted(groups, key=lambda g: 1 if g["type"] == "twelvedata" else 0)
     for src in groups:
         df_htf, df_ent = _fetch_from_src(src, instrument, mode, history)
         if df_htf is not None and df_ent is not None:
@@ -1108,16 +1112,16 @@ def backtest_mtf_fast(
     gl   = abs(sum(p for p in trades_pnl if p < 0))
     pf   = (gw / (gl + 1e-8)) if n_tr else 0.0
 
-    if n_tr < min_trades:
-        return {"score": -1e9, "trades": n_tr, "winrate": wr, "profit_factor": pf,
-                "max_dd": 0.0, "sqn": 0.0, "equity_curve": curve, "trades_r": trades_r}
     pk, mdd = curve[0], 0.0
     for v in curve:
         pk = max(pk, v)
         mdd = max(mdd, (pk - v) / max(pk, 1e-9))
-    exp_r = float(sum(trades_r) / n_tr)
+    exp_r = float(sum(trades_r) / n_tr) if n_tr > 0 else 0.0
     std_r = float(np.std(trades_r, ddof=1)) if n_tr > 1 else 1.0
-    sqn   = (math.sqrt(n_tr) * exp_r / std_r) if std_r > 1e-9 else 0.0
+    sqn   = (math.sqrt(n_tr) * exp_r / std_r) if (n_tr >= 2 and std_r > 1e-9) else 0.0
+    if n_tr < min_trades:
+        return {"score": -1e9, "trades": n_tr, "winrate": wr, "profit_factor": pf,
+                "max_dd": mdd, "sqn": sqn, "equity_curve": curve, "trades_r": trades_r}
     score = exp_r * wr * math.log1p(pf) * (1.0 - mdd) * min(1.0, math.sqrt(n_tr / 40.0))
     return {"score": score, "trades": n_tr, "winrate": wr, "profit_factor": pf,
             "max_dd": mdd, "sqn": sqn, "equity_curve": curve, "trades_r": trades_r}
@@ -1463,9 +1467,9 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
         n_ent = len(df_ent)
         usable = n_ent - 80
         folds = [
-            (80 + int(usable * 0.45), 80 + int(usable * 0.63)),
-            (80 + int(usable * 0.63), 80 + int(usable * 0.81)),
-            (80 + int(usable * 0.81), n_ent),
+            (80 + int(usable * 0.45), 80 + int(usable * 0.67)),
+            (80 + int(usable * 0.60), 80 + int(usable * 0.82)),
+            (80 + int(usable * 0.78), n_ent),
         ]
 
         sig_caches = {
@@ -1482,21 +1486,21 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
                     for tpm in tp_grid:
                         if tpm <= slm * 1.25:
                             continue
-                        is_r = backtest_mtf_fast(ent_a, ent_open_ts, sc, inst, mode, slm, tpm, min_trades=6, start_idx=80, end_idx=is_end)
+                        is_r = backtest_mtf_fast(ent_a, ent_open_ts, sc, inst, mode, slm, tpm, min_trades=5, start_idx=80, end_idx=is_end)
                         if best_is is None or is_r["score"] > best_is[0]:
                             best_is = (is_r["score"], th, slm, tpm)
             if best_is is None:
                 continue
             _, th, slm, tpm = best_is
             latest_pick = (th, slm, tpm)
-            oos_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=3, start_idx=is_end, end_idx=oos_end)
-            if oos_r["trades"] >= 3 and oos_r["profit_factor"] >= 1.0 and oos_r["max_dd"] <= 0.25:
+            oos_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=2, start_idx=is_end, end_idx=oos_end)
+            if oos_r["trades"] >= 2 and oos_r["profit_factor"] >= 1.0 and oos_r["max_dd"] <= 0.25:
                 oos_passes += 1
 
         th, slm, tpm = latest_pick
-        full_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=10, start_idx=80, end_idx=n_ent)
+        full_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=8, start_idx=80, end_idx=n_ent)
         mc_prob = monte_carlo_prob_profit(full_r["trades_r"], runs=int(GLOBAL["mc_runs"]), risk_frac=float(GLOBAL["bt_risk_pct"]))
-        enabled = (oos_passes >= 2) and (full_r["profit_factor"] >= float(GLOBAL["bt_min_profit_factor"])) and (mc_prob >= float(GLOBAL["mc_min_prob_profit"]))
+        enabled = (oos_passes >= 2) and (full_r["trades"] >= 8) and (full_r["profit_factor"] >= float(GLOBAL["bt_min_profit_factor"])) and (mc_prob >= float(GLOBAL["mc_min_prob_profit"]))
 
         calibrated[f"{inst}:{mode}"] = {
             "enabled": enabled,
