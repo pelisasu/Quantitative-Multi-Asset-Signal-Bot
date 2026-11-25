@@ -1,67 +1,67 @@
 {
   "XAUUSD:SWING": {
     "enabled": true,
-    "sl_mult": 1.8,
-    "tp_mult": 4.0,
+    "sl_mult": 2.3,
+    "tp_mult": 5.2,
     "trail_mult": 1.5,
-    "threshold": 68,
-    "is_pf": 1.41,
-    "oos_pf": 1.24,
-    "updated_at": "2026-11-23T12:37:37Z"
+    "threshold": 72,
+    "is_pf": 1.38,
+    "oos_pf": 1.4,
+    "updated_at": "2026-11-25T05:47:00Z"
   },
   "BTCUSD:SWING": {
     "enabled": true,
-    "sl_mult": 2.2,
-    "tp_mult": 5.0,
+    "sl_mult": 2.3,
+    "tp_mult": 5.2,
     "trail_mult": 1.5,
     "threshold": 65,
-    "is_pf": 1.31,
-    "oos_pf": 1.35,
-    "updated_at": "2026-11-25T05:17:53Z"
+    "is_pf": 1.62,
+    "oos_pf": 1.92,
+    "updated_at": "2026-11-25T05:48:22Z"
   },
   "ETHUSD:SWING": {
     "enabled": false,
     "reason": "failed_oos_walk_forward",
-    "best_is_pf": 0.97,
-    "oos_pf": 2.01,
-    "updated_at": "2026-11-25T05:18:52Z"
+    "best_is_pf": 0.98,
+    "oos_pf": 2.42,
+    "updated_at": "2026-11-25T05:49:03Z"
   },
   "NAS100:SCALPING": {
-    "enabled": false,
-    "reason": "failed_oos_walk_forward",
-    "best_is_pf": 1.68,
-    "oos_pf": 1.09,
-    "updated_at": "2026-11-25T05:20:45Z"
+    "enabled": true,
+    "sl_mult": 1.8,
+    "tp_mult": 3.0,
+    "trail_mult": 1.4,
+    "threshold": 65,
+    "is_pf": 1.74,
+    "oos_pf": 7.44,
+    "updated_at": "2026-11-25T05:49:30Z"
   },
   "NAS100:SWING": {
-    "enabled": true,
-    "sl_mult": 2.6,
-    "tp_mult": 3.2,
-    "trail_mult": 1.5,
-    "threshold": 65,
-    "is_pf": 1.39,
-    "oos_pf": 1.23,
-    "updated_at": "2026-11-23T12:38:12Z"
+    "enabled": false,
+    "reason": "failed_oos_walk_forward",
+    "best_is_pf": 0.84,
+    "oos_pf": 1.45,
+    "updated_at": "2026-11-25T05:47:30Z"
   },
   "XAUUSD:SCALPING": {
     "enabled": false,
     "reason": "failed_oos_walk_forward",
-    "best_is_pf": 0.75,
-    "oos_pf": 0.57,
-    "updated_at": "2026-11-25T05:19:58Z"
+    "best_is_pf": 0.58,
+    "oos_pf": 1.09,
+    "updated_at": "2026-11-25T05:49:18Z"
   },
   "BTCUSD:SCALPING": {
     "enabled": false,
     "reason": "failed_oos_walk_forward",
-    "best_is_pf": 0.91,
-    "oos_pf": 0.77,
-    "updated_at": "2026-11-25T05:22:04Z"
+    "best_is_pf": 1.04,
+    "oos_pf": 3.26,
+    "updated_at": "2026-11-25T05:50:09Z"
   },
   "ETHUSD:SCALPING": {
     "enabled": false,
     "reason": "failed_oos_walk_forward",
-    "best_is_pf": 0.55,
-    "oos_pf": 0.71,
-    "updated_at": "2026-11-25T05:23:25Z"
+    "best_is_pf": 0.87,
+    "oos_pf": 1.4,
+    "updated_at": "2026-11-25T05:50:44Z"
   }
 }
