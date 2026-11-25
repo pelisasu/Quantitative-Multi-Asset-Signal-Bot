@@ -1,8 +1,8 @@
 """
 ==============================================================================
-AUTO TRADING SIGNAL BOT v3.0.0 — QUANTITATIVE MULTI-ASSET ENGINE
+AUTO TRADING SIGNAL BOT v3.1.0 — QUANTITATIVE MULTI-ASSET ENGINE
 Instruments : XAUUSD, NAS100, BTCUSD, ETHUSD
-Modes       : SCALPING, SWING
+Modes       : SCALPING (1h HTF / 15m Entry), SWING (4h HTF / 1h Entry)
 CLI         : --mode live | --mode backtest | --mode both | --mode check
 State       : SQLite (trading_signals.db) + calibrated_params.json
 Notify      : Telegram (HTML, concise) + Discord (optional)
@@ -73,12 +73,14 @@ GLOBAL = {
     "min_score_signal":      68,
     "donchian_bars":         20,
     "bos_fresh_max_bars":    14,
-    "rsi_max_buy":           74.0,
-    "rsi_min_sell":          26.0,
-    "mad_z_max_abs":         3.4,
-    "max_candle_atr":        3.0,
-    "stale_max_min":         {"1m": 15, "5m": 25, "15m": 45, "1h": 150, "4h": 480},
-    "closed_stale_extra_min": 4 * 24 * 60,
+    "rsi_max_buy":           72.0,
+    "rsi_min_sell":          28.0,
+    "mad_z_max_abs":         3.2,
+    "max_candle_atr":        2.8,
+    "max_dist_ema20_atr":    2.3,
+    "min_atr_cost_mult":     3.5,
+    "stale_max_min":         {"1m": 15, "5m": 25, "15m": 50, "1h": 300, "4h": 600},
+    "closed_stale_extra_min": 5 * 24 * 60,
     "spike_mad_threshold":   9.0,
     "spread_pts":   {"XAUUSD": 0.35, "NAS100": 1.5, "BTCUSD": 15.0, "ETHUSD": 1.2},
     "slippage_pts": {"XAUUSD": 0.15, "NAS100": 0.5, "BTCUSD":  5.0, "ETHUSD": 0.4},
@@ -88,9 +90,8 @@ GLOBAL = {
     "bt_max_dd_stop":        0.30,
     "bt_min_trades":         16,
     "bt_oos_fraction":       0.30,
-    "bt_oos_min_ratio":      0.30,
-    "bt_min_profit_factor":  1.08,
-    "bt_oos_min_pf":         1.00,
+    "bt_min_profit_factor":  1.05,
+    "bt_oos_min_pf":         1.02,
 }
 
 INSTRUMENTS: Dict[str, Dict[str, Any]] = {
@@ -146,17 +147,19 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
 
 TIMEFRAMES = {
     "SCALPING": {
-        "htf": "15m", "entry": "5m", "htf_sec": 900, "entry_sec": 300,
-        "period_htf": "15d", "period_entry": "7d",
-        "min_bars_htf": 120, "min_bars_entry": 160,
-        "sl_atr": 1.8, "trail_atr": 1.2, "tp_atr": [1.8, 3.2, 4.5], "max_hold_bars": 48,
-        "cooldown_same_min": 45, "cooldown_flip_min": 90,
+        "htf": "1h", "entry": "15m", "htf_sec": 3600, "entry_sec": 900,
+        "period_htf": "60d", "period_entry": "15d",
+        "min_bars_htf": 160, "min_bars_entry": 160,
+        "sl_atr": 2.0, "trail_atr": 1.4, "be_trigger_r": 1.15,
+        "tp_atr": [2.0, 3.6, 5.0], "max_hold_bars": 48,
+        "cooldown_same_min": 60, "cooldown_flip_min": 120,
     },
     "SWING": {
         "htf": "4h", "entry": "1h", "htf_sec": 14400, "entry_sec": 3600,
         "period_htf": "90d", "period_entry": "90d",
         "min_bars_htf": 160, "min_bars_entry": 240,
-        "sl_atr": 2.2, "trail_atr": 1.5, "tp_atr": [2.2, 4.0, 5.5], "max_hold_bars": 96,
+        "sl_atr": 2.2, "trail_atr": 1.5, "be_trigger_r": 1.10,
+        "tp_atr": [2.2, 4.0, 5.5], "max_hold_bars": 96,
         "cooldown_same_min": 120, "cooldown_flip_min": 240,
     },
 }
@@ -213,10 +216,8 @@ def market_open(inst: str, now: Optional[datetime] = None, for_monitoring: bool 
     mins = ny.hour * 60 + ny.minute
 
     if kind == "index":
-        # Monitoring open trades tracks NQ=F Globex hours so overnight SL/TP triggers aren't delayed
         if for_monitoring:
             return _cme_futures_open(ny)
-        # Entry signals only during high-liquidity US Cash RTH: Mon-Fri 09:30 - 16:00 NY
         return (wd < 5) and (9 * 60 + 30 <= mins < 16 * 60)
 
     if kind == "commodity":
@@ -289,7 +290,7 @@ def fetch_coinbase(product: str, granularity: int, min_bars: int, max_batches: i
             delay = 0.6
             for _ in range(3):
                 try:
-                    r = requests.get(url, timeout=20, headers={"User-Agent": "signal-bot-v3/3.0.0"})
+                    r = requests.get(url, timeout=20, headers={"User-Agent": "signal-bot-v3/3.1.0"})
                     if r.status_code == 429:
                         time.sleep(delay)
                         delay = min(delay * 2, 5.0)
@@ -320,7 +321,8 @@ def fetch_coinbase(product: str, granularity: int, min_bars: int, max_batches: i
         return None
 
 def sanitize_and_drop_unclosed(df: Any, interval: str, bar_sec: int,
-                               min_bars: int, instrument: str) -> Optional[Any]:
+                               min_bars: int, instrument: str,
+                               check_stale: bool = True) -> Optional[Any]:
     if df is None or df.empty:
         return None
     now_ts = pd.Timestamp.now(tz="UTC")
@@ -329,14 +331,15 @@ def sanitize_and_drop_unclosed(df: Any, interval: str, bar_sec: int,
         df = df.iloc[:-1].copy()
     if len(df) < min_bars:
         return None
-    last_close = df.index[-1] + pd.Timedelta(seconds=bar_sec)
-    age_min = (now_ts - last_close).total_seconds() / 60.0
-    limit = GLOBAL["stale_max_min"].get(interval, 120)
-    if not market_open(instrument, for_monitoring=True):
-        limit = max(limit, GLOBAL["closed_stale_extra_min"])
-    if age_min > limit:
-        logging.info(f"[sanitize] {instrument} {interval} stale closed age={age_min:.0f}m > {limit}m")
-        return None
+    if check_stale:
+        last_close = df.index[-1] + pd.Timedelta(seconds=bar_sec)
+        age_min = (now_ts - last_close).total_seconds() / 60.0
+        limit = GLOBAL["stale_max_min"].get(interval, 150)
+        if not market_open(instrument, for_monitoring=True):
+            limit = max(limit, GLOBAL["closed_stale_extra_min"])
+        if age_min > limit:
+            logging.info(f"[sanitize] {instrument} {interval} stale closed age={age_min:.0f}m > {limit}m")
+            return None
     return df
 
 def resample_ohlcv(df: Any, rule_sec: int) -> Optional[Any]:
@@ -356,6 +359,8 @@ def _fetch_from_src(src: Dict[str, Any], instrument: str, mode: str, history: bo
                     ) -> Tuple[Optional[Any], Optional[Any]]:
     tf = TIMEFRAMES[mode]
     df_htf = df_ent = None
+    check_stale = not history
+
     if mode == "SWING":
         min_ent = 500 if history else tf["min_bars_entry"]
         if src["type"] == "yfinance":
@@ -364,26 +369,37 @@ def _fetch_from_src(src: Dict[str, Any], instrument: str, mode: str, history: bo
         elif src["type"] == "coinbase":
             b_ent = 20 if history else 4
             df_ent = fetch_coinbase(src["symbol"], 3600, min_ent, max_batches=b_ent)
-        df_ent = sanitize_and_drop_unclosed(df_ent, tf["entry"], tf["entry_sec"], min_ent, instrument)
+        df_ent = sanitize_and_drop_unclosed(
+            df_ent, tf["entry"], tf["entry_sec"], min_ent, instrument, check_stale=check_stale
+        )
         if df_ent is not None:
             df_htf = resample_ohlcv(df_ent, tf["htf_sec"])
-            df_htf = sanitize_and_drop_unclosed(df_htf, tf["htf"], tf["htf_sec"], tf["min_bars_htf"], instrument)
+            df_htf = sanitize_and_drop_unclosed(
+                df_htf, tf["htf"], tf["htf_sec"], tf["min_bars_htf"], instrument, check_stale=check_stale
+            )
     else:
+        # SCALPING: 1h HTF / 15m Entry
+        min_ent = 450 if history else tf["min_bars_entry"]
+        min_htf = 220 if history else tf["min_bars_htf"]
         if src["type"] == "yfinance":
-            p_htf = "59d" if history else tf["period_htf"]
-            p_ent = "59d" if history else tf["period_entry"]
-            df_htf = fetch_yf(src["symbol"], tf["htf"],   p_htf, tf["min_bars_htf"])
-            df_ent = fetch_yf(src["symbol"], tf["entry"], p_ent, tf["min_bars_entry"])
+            p_htf = "730d" if history else tf["period_htf"]
+            p_ent = "59d"  if history else tf["period_entry"]
+            df_htf = fetch_yf(src["symbol"], tf["htf"],   p_htf, min_htf)
+            df_ent = fetch_yf(src["symbol"], tf["entry"], p_ent, min_ent)
         elif src["type"] == "coinbase":
             g_htf = COINBASE_GRAN.get(tf["htf"])
             g_ent = COINBASE_GRAN.get(tf["entry"])
             if g_htf and g_ent:
-                b_htf = 12 if history else 2
-                b_ent = 28 if history else 2
-                df_htf = fetch_coinbase(src["symbol"], g_htf, tf["min_bars_htf"], max_batches=b_htf)
-                df_ent = fetch_coinbase(src["symbol"], g_ent, tf["min_bars_entry"], max_batches=b_ent)
-        df_htf = sanitize_and_drop_unclosed(df_htf, tf["htf"],   tf["htf_sec"],   tf["min_bars_htf"],   instrument)
-        df_ent = sanitize_and_drop_unclosed(df_ent, tf["entry"], tf["entry_sec"], tf["min_bars_entry"], instrument)
+                b_htf = 8  if history else 2
+                b_ent = 20 if history else 2   # ~60d of 15m candles
+                df_htf = fetch_coinbase(src["symbol"], g_htf, min_htf, max_batches=b_htf)
+                df_ent = fetch_coinbase(src["symbol"], g_ent, min_ent, max_batches=b_ent)
+        df_htf = sanitize_and_drop_unclosed(
+            df_htf, tf["htf"], tf["htf_sec"], min_htf, instrument, check_stale=check_stale
+        )
+        df_ent = sanitize_and_drop_unclosed(
+            df_ent, tf["entry"], tf["entry_sec"], min_ent, instrument, check_stale=check_stale
+        )
 
     if df_htf is not None and df_ent is not None:
         mul, off = src.get("multiplier", 1.0), src.get("offset", 0.0)
@@ -403,7 +419,7 @@ def fetch_pair_locked(instrument: str, mode: str, history: bool = False,
         pref_name = preferred_source.split(":")[0]
         matched = [g for g in groups if g["name"] == pref_name]
         if matched:
-            groups = matched  # Strictly lock to original trade source to prevent Futures/Spot basis mismatch
+            groups = matched
     for src in groups:
         df_htf, df_ent = _fetch_from_src(src, instrument, mode, history)
         if df_htf is not None and df_ent is not None:
@@ -494,16 +510,16 @@ def detect_regime_row(row: Any) -> str:
     e50 = float(row.get("ema50", 0.0) or 0.0)
     if not (np.isfinite(atr) and atr > 0):
         return "UNKNOWN"
-    if rk < 0.10 and er < 0.22 and adx < 18.0:
+    if rk < 0.12 and er < 0.24 and adx < 19.0:
         return "CHOPPY"
     ema_sep_atr = abs(e20 - e50) / max(atr, 1e-9)
     if (
         (adx >= 21.0 and er >= 0.22)
-        or (adx >= 26.0 and er >= 0.14 and ema_sep_atr >= 0.35)
+        or (adx >= 26.0 and er >= 0.15 and ema_sep_atr >= 0.35)
         or (er >= 0.35 and ema_sep_atr >= 0.45)
     ):
         return "TREND"
-    if adx < 17.0 and er < 0.21:
+    if adx < 18.0 and er < 0.22:
         return "CHOPPY"
     return "RANGE"
 
@@ -519,7 +535,7 @@ def spike_ok(df: Any, idx: int) -> bool:
     return abs(cur - med) / scale < GLOBAL["spike_mad_threshold"]
 
 # ==============================================================================
-# UNIFIED DUAL-SETUP SIGNAL ENGINE (BREAKOUT + TREND PULLBACK)
+# UNIFIED DUAL-SETUP SIGNAL ENGINE (HIGH-CONVICTION BREAKOUT + PULLBACK)
 # ==============================================================================
 def _fresh_bos_bars_ago(htf_closes: Any, htf_sh: Any, htf_sl: Any,
                         htf_idx: int, direction: str) -> Optional[int]:
@@ -543,7 +559,8 @@ def _fresh_bos_bars_ago(htf_closes: Any, htf_sh: Any, htf_sl: Any,
     return 25 if is_broken_at(htf_idx, direction) else None
 
 def evaluate_bar_pair(htf_df: Any, htf_sh: Any, htf_sl: Any, htf_idx: int,
-                      ent_df: Any, ent_idx: int, threshold: int
+                      ent_df: Any, ent_idx: int, threshold: int,
+                      instrument: Optional[str] = None
                       ) -> Tuple[Optional[Tuple[str, int, str, str, Dict[str, float]]], str]:
     don_n = int(GLOBAL["donchian_bars"])
     if htf_idx < 80 or ent_idx < max(60, don_n + 1):
@@ -561,6 +578,11 @@ def evaluate_bar_pair(htf_df: Any, htf_sh: Any, htf_sl: Any, htf_idx: int,
     if not np.isfinite(atr) or atr <= 0 or not np.isfinite(he200):
         return None, "invalid_atr_or_ema200"
 
+    if instrument is not None:
+        rt_cost = float(GLOBAL["spread_pts"].get(instrument, 0.0)) + 2.0 * float(GLOBAL["slippage_pts"].get(instrument, 0.0))
+        if rt_cost > 0 and atr < float(GLOBAL["min_atr_cost_mult"]) * rt_cost:
+            return None, f"low_atr_vs_cost ({atr:.2f}<{GLOBAL['min_atr_cost_mult']*rt_cost:.2f})"
+
     regime = detect_regime_row(htf_row)
     if regime in ("CHOPPY", "UNKNOWN"):
         return None, f"regime={regime} (skip chop)"
@@ -575,35 +597,51 @@ def evaluate_bar_pair(htf_df: Any, htf_sh: Any, htf_sl: Any, htf_idx: int,
     if c_rng > float(GLOBAL["max_candle_atr"]) * atr:
         return None, f"climax_candle ({c_rng/atr:.1f}xATR)"
     close_pos = (ec - el) / c_rng
+    body_ratio = abs(ec - eo) / c_rng
 
-    # Setup A: Donchian-20 Breakout trigger
-    hi20 = float(ent_df["High"].iloc[ent_idx - don_n : ent_idx].max())
-    lo20 = float(ent_df["Low"].iloc[ent_idx - don_n : ent_idx].min())
-    bull_brk = (ec > hi20) and (prev_c <= hi20) and (close_pos >= 0.52)
-    bear_brk = (ec < lo20) and (prev_c >= lo20) and (close_pos <= 0.48)
-
-    # Setup B: Trend Pullback Continuation trigger (only in TREND regime)
     ee20, ee50 = float(ent_row["ema20"]), float(ent_row["ema50"])
     slope = float(ent_row["slope20"])
     rsi = float(ent_row["rsi14"])
     mad_z = float(ent_row["mad_zscore20"]) if np.isfinite(ent_row["mad_zscore20"]) else 0.0
     pdi, mdi, adx = float(htf_row["plus_di"]), float(htf_row["minus_di"]), float(htf_row["adx14"])
+    ent_atr_rk = float(ent_row.get("atr_pct_rank", 0.5) or 0.5)
+    dist_e20_atr = abs(ec - ee20) / max(atr, 1e-9)
 
+    # Setup A: Donchian-20 Breakout (only in TREND or expanding volatility, never stretched)
+    hi20 = float(ent_df["High"].iloc[ent_idx - don_n : ent_idx].max())
+    lo20 = float(ent_df["Low"].iloc[ent_idx - don_n : ent_idx].min())
+    brk_vol_ok = (regime == "TREND") or (adx >= 20.0 and ent_atr_rk >= 0.35)
+    bull_brk = (
+        brk_vol_ok
+        and (ec > hi20) and (prev_c <= hi20)
+        and (close_pos >= 0.58) and (body_ratio >= 0.35)
+        and (dist_e20_atr <= float(GLOBAL["max_dist_ema20_atr"]))
+    )
+    bear_brk = (
+        brk_vol_ok
+        and (ec < lo20) and (prev_c >= lo20)
+        and (close_pos <= 0.42) and (body_ratio >= 0.35)
+        and (dist_e20_atr <= float(GLOBAL["max_dist_ema20_atr"]))
+    )
+
+    # Setup B: Trend Pullback Continuation (strict TREND regime + value-zone rejection)
     bull_pb = (
         regime == "TREND"
         and htf_trend == 1 and hc > he50 and he50 > he200 and pdi > mdi
         and ee20 > ee50 and slope > 0
-        and el <= ee20 + 0.35 * atr
-        and ec > ee20 and ec > eo and close_pos >= 0.55
-        and 40.0 <= rsi <= 66.0
+        and el <= ee20 + 0.25 * atr
+        and ec > ee20 and ec > eo
+        and close_pos >= 0.60 and body_ratio >= 0.38
+        and 42.0 <= rsi <= 65.0
     )
     bear_pb = (
         regime == "TREND"
         and htf_trend == -1 and hc < he50 and he50 < he200 and mdi > pdi
         and ee20 < ee50 and slope < 0
-        and eh >= ee20 - 0.35 * atr
-        and ec < ee20 and ec < eo and close_pos <= 0.45
-        and 34.0 <= rsi <= 60.0
+        and eh >= ee20 - 0.25 * atr
+        and ec < ee20 and ec < eo
+        and close_pos <= 0.40 and body_ratio >= 0.38
+        and 35.0 <= rsi <= 58.0
     )
 
     htf_closes = htf_df["Close"].to_numpy(dtype=float)
@@ -729,16 +767,19 @@ def evaluate_signal(instrument: str, mode: str,
     trail_mult = float(cal_d.get("trail_mult", tf["trail_atr"]))
     tp3_mult   = max(float(tf["tp_atr"][2]), round(tp2_mult * 1.25, 2))
 
-    # Cron-jitter protection for SCALPING: check latest bar (-1), and if none, check (-2)
-    # only if it closed <= 11 minutes ago and current close hasn't run away > 0.35*ATR
+    # Cron-jitter protection for 15m SCALPING: check (-1), fallback to (-2) if closed <= 20m ago
     eval_idx = len(df_ent) - 1
-    res, diag = evaluate_bar_pair(df_htf, htf_sh, htf_sl, len(df_htf) - 1, df_ent, eval_idx, threshold)
+    res, diag = evaluate_bar_pair(
+        df_htf, htf_sh, htf_sl, len(df_htf) - 1, df_ent, eval_idx, threshold, instrument=instrument
+    )
 
     if res is None and mode == "SCALPING" and len(df_ent) >= 3:
         prev_bar_close = df_ent.index[-2] + pd.Timedelta(seconds=tf["entry_sec"])
         age_sec = (pd.Timestamp.now(tz="UTC") - prev_bar_close).total_seconds()
-        if age_sec <= 660:
-            res2, diag2 = evaluate_bar_pair(df_htf, htf_sh, htf_sl, len(df_htf) - 1, df_ent, len(df_ent) - 2, threshold)
+        if age_sec <= 1200:
+            res2, diag2 = evaluate_bar_pair(
+                df_htf, htf_sh, htf_sl, len(df_htf) - 1, df_ent, len(df_ent) - 2, threshold, instrument=instrument
+            )
             if res2 is not None:
                 c_now = float(df_ent["Close"].iloc[-1])
                 c_prev = res2[4]["entry"]
@@ -807,6 +848,7 @@ def backtest_mtf(df_htf: Any, df_ent: Any, instrument: str, mode: str,
     slip   = float(GLOBAL["slippage_pts"].get(instrument, 0.1))
     risk_frac = float(GLOBAL["bt_risk_pct"])
     trail_mult = float(tf["trail_atr"])
+    be_trigger_r = float(tf["be_trigger_r"])
 
     if precomputed is not None:
         df_htf, df_ent, htf_sh, htf_sl = precomputed
@@ -844,7 +886,9 @@ def backtest_mtf(df_htf: Any, df_ent: Any, instrument: str, mode: str,
             i += 1
             continue
 
-        res, _ = evaluate_bar_pair(df_htf, htf_sh, htf_sl, htf_ptr, df_ent, i, threshold)
+        res, _ = evaluate_bar_pair(
+            df_htf, htf_sh, htf_sl, htf_ptr, df_ent, i, threshold, instrument=instrument
+        )
         if res is None:
             i += 1
             continue
@@ -884,7 +928,7 @@ def backtest_mtf(df_htf: Any, df_ent: Any, instrument: str, mode: str,
                 if bl <= active_sl: exit_px, exit_reason, exit_j = active_sl - slip, ("BE" if moved_be else "SL"), j; break
                 if bh >= tp_tgt:    exit_px, exit_reason, exit_j = tp_tgt, "TP", j; break
                 if bh > max_fav: max_fav = bh
-                if (max_fav - fill) >= sl_dist:
+                if (max_fav - fill) >= be_trigger_r * sl_dist:
                     moved_be = True
                     active_sl = max(active_sl, fill + 0.05 * sl_dist, max_fav - trail_dist)
             else:
@@ -893,7 +937,7 @@ def backtest_mtf(df_htf: Any, df_ent: Any, instrument: str, mode: str,
                 if ah >= active_sl: exit_px, exit_reason, exit_j = active_sl + slip, ("BE" if moved_be else "SL"), j; break
                 if al <= tp_tgt:    exit_px, exit_reason, exit_j = tp_tgt, "TP", j; break
                 if al < max_fav: max_fav = al
-                if (fill - max_fav) >= sl_dist:
+                if (fill - max_fav) >= be_trigger_r * sl_dist:
                     moved_be = True
                     active_sl = min(active_sl, fill - 0.05 * sl_dist, max_fav + trail_dist)
             if j == max_j:
@@ -1247,9 +1291,9 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
         if fresh.empty:
             continue
 
-        # Always compute orig_risk from IMMUTABLE initial_sl
         orig_risk = max(abs(float(entry) - float(initial_sl)), 1e-9)
         t_dist = float(trail_dist) if trail_dist and float(trail_dist) > 0 else orig_risk * (tf["trail_atr"] / tf["sl_atr"])
+        be_trig = float(tf["be_trigger_r"]) * orig_risk
         active_sl = float(sl)
         be_on = int(be_active or 0)
         held = int(bars_held or 0)
@@ -1290,7 +1334,7 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
                     conn.commit()
                     _notify_all(f"🎯 <b>{_esc(inst)} {_esc(mode)} BUY</b> TP2 @ <code>{tp2:.2f}</code> ({r_res:+.2f}R)")
                     break
-                if (hi - entry) >= orig_risk:
+                if (hi - entry) >= be_trig:
                     new_sl = max(active_sl, entry + 0.05 * orig_risk, hi - t_dist)
                     if not be_on:
                         be_on = 1
@@ -1300,7 +1344,7 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
                             (round(active_sl, 4), bar_iso, held, tid),
                         )
                         conn.commit()
-                        _notify_all(f"🔄 <b>{_esc(inst)} {_esc(mode)} BUY</b> +1R Trail aktif (SL <code>{active_sl:.2f}</code>)")
+                        _notify_all(f"🔄 <b>{_esc(inst)} {_esc(mode)} BUY</b> Trail aktif (SL <code>{active_sl:.2f}</code>)")
                     elif new_sl > active_sl:
                         active_sl = new_sl
                         conn.execute(
@@ -1346,7 +1390,7 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
                     conn.commit()
                     _notify_all(f"🎯 <b>{_esc(inst)} {_esc(mode)} SELL</b> TP2 @ <code>{tp2:.2f}</code> ({r_res:+.2f}R)")
                     break
-                if (entry - lo) >= orig_risk:
+                if (entry - lo) >= be_trig:
                     new_sl = min(active_sl, entry - 0.05 * orig_risk, lo + t_dist)
                     if not be_on:
                         be_on = 1
@@ -1356,7 +1400,7 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
                             (round(active_sl, 4), bar_iso, held, tid),
                         )
                         conn.commit()
-                        _notify_all(f"🔄 <b>{_esc(inst)} {_esc(mode)} SELL</b> +1R Trail aktif (SL <code>{active_sl:.2f}</code>)")
+                        _notify_all(f"🔄 <b>{_esc(inst)} {_esc(mode)} SELL</b> Trail aktif (SL <code>{active_sl:.2f}</code>)")
                     elif new_sl < active_sl:
                         active_sl = new_sl
                         conn.execute(
@@ -1418,7 +1462,7 @@ def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 def build_status_summary(conn: sqlite3.Connection) -> str:
     calibrated = load_calibrated_params()
-    lines = ["📊 <b>Status Market & Sinyal (v3.0)</b>"]
+    lines = ["📊 <b>Status Market & Sinyal (v3.1)</b>"]
     for inst in INSTRUMENTS:
         open_rows = conn.execute(
             "SELECT mode, direction, entry, initial_sl, sl, be_active, source FROM open_trades "
@@ -1458,9 +1502,9 @@ def build_status_summary(conn: sqlite3.Connection) -> str:
                 f"{sc_i}/100 | {_esc(reg or '-')} | {age}m lalu"
             )
         else:
-            cal_s = "active"
-            if calibrated.get(f"{inst}:SCALPING", {}).get("enabled") is False and calibrated.get(f"{inst}:SWING", {}).get("enabled") is False:
-                cal_s = "OOS-off"
+            sc_en = calibrated.get(f"{inst}:SCALPING", {}).get("enabled")
+            sw_en = calibrated.get(f"{inst}:SWING", {}).get("enabled")
+            cal_s = "OOS-off" if (sc_en is False and sw_en is False) else "active"
             lines.append(f"• <b>{inst}</b>{mkt_tag} standby ({cal_s})")
     lines.append(f"🕒 <code>{now_utc().strftime('%H:%M UTC')}</code>")
     return "\n".join(lines)
@@ -1471,7 +1515,7 @@ def build_perf_summary(conn: sqlite3.Connection) -> str:
     ).fetchall()
     open_cnt = conn.execute("SELECT COUNT(*) FROM open_trades WHERE status='OPEN'").fetchone()[0]
     if not rows:
-        return f"📈 <b>Live Performance v3.0</b>\nBelum ada trade tertutup. Open: <code>{open_cnt}</code>"
+        return f"📈 <b>Live Performance v3.1</b>\nBelum ada trade tertutup. Open: <code>{open_cnt}</code>"
     rs = [float(r or 0.0) for _, r in rows]
     total = len(rs)
     wins = sum(1 for r in rs if r > 0)
@@ -1483,7 +1527,7 @@ def build_perf_summary(conn: sqlite3.Connection) -> str:
     avg_r = net_r / total
     wr = (wins / total) * 100.0
     return (
-        f"📈 <b>Live Performance v3.0</b>\n"
+        f"📈 <b>Live Performance v3.1</b>\n"
         f"• Closed: <code>{total}</code> ({wins}W/{losses}L) | Open: <code>{open_cnt}</code>\n"
         f"• Winrate: <code>{wr:.1f}%</code> | PF: <code>{pf:.2f}</code>\n"
         f"• Avg: <code>{avg_r:+.2f}R</code> | Net: <code>{net_r:+.2f}R</code>"
@@ -1555,7 +1599,6 @@ def run_live(conn: sqlite3.Connection) -> None:
 
             msg = format_signal_message(sig)
 
-            # Atomic DB-first write prevents duplicate Telegram spam if any DB error occurs
             with conn:
                 cur = conn.execute(
                     "INSERT INTO signals("
@@ -1595,22 +1638,22 @@ def run_live(conn: sqlite3.Connection) -> None:
             logging.info(f"[notify] {inst} {mode} {sig['direction']} | telegram={tg_ok} discord={dc_ok}")
 
 # ==============================================================================
-# WALK-FORWARD CALIBRATION
+# WALK-FORWARD CALIBRATION (NO RATIO TRAP + HONEST OOS GATE)
 # ==============================================================================
 def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
     calibrated = load_calibrated_params()
     curves: Dict[str, List[float]] = {}
     summary_lines: List[str] = []
     tf = TIMEFRAMES[mode]
-    is_min_tr  = max(12, int(GLOBAL["bt_min_trades"] * 0.70))
-    oos_min_tr = max(5,  int(GLOBAL["bt_min_trades"] * 0.25))
+    is_min_tr  = max(10, int(GLOBAL["bt_min_trades"] * 0.65))
+    oos_min_tr = max(4,  int(GLOBAL["bt_min_trades"] * 0.25))
 
-    sl_grid = (1.6, 2.0, 2.4) if mode == "SCALPING" else (1.8, 2.2, 2.6)
-    tp_grid = (2.8, 3.5, 4.2) if mode == "SCALPING" else (3.2, 4.0, 5.0)
+    sl_grid = (1.8, 2.2, 2.5) if mode == "SCALPING" else (2.0, 2.3, 2.7)
+    tp_grid = (3.0, 3.8, 4.6) if mode == "SCALPING" else (3.5, 4.2, 5.2)
 
     for inst in INSTRUMENTS:
         df_htf, df_ent, src = fetch_pair_locked(inst, mode, history=True)
-        if df_htf is None or df_ent is None or len(df_ent) < 500:
+        if df_htf is None or df_ent is None or len(df_ent) < 400:
             logging.info(f"[cal-skip] {inst} {mode} insufficient history")
             continue
         logging.info(f"[cal-scan] {inst} {mode} src={src} htf={len(df_htf)} ent={len(df_ent)}")
@@ -1626,7 +1669,7 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
         best_is_diag: Optional[Dict[str, Any]] = None
         for slm in sl_grid:
             for tpm in tp_grid:
-                if tpm <= slm * 1.2:
+                if tpm <= slm * 1.25:
                     continue
                 for th in (65, 68, 72):
                     is_r = backtest_mtf(
@@ -1634,7 +1677,7 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
                         min_trades=is_min_tr, precomputed=pre_full,
                         start_idx=80, end_idx=split_e,
                     )
-                    if best_is_diag is None or is_r["profit_factor"] > best_is_diag["pf"]:
+                    if best_is_diag is None or (is_r["trades"] >= is_min_tr and is_r["profit_factor"] > best_is_diag["pf"]):
                         best_is_diag = {
                             "pf": is_r["profit_factor"], "t": is_r["trades"],
                             "slm": slm, "tpm": tpm, "th": th,
@@ -1648,10 +1691,9 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
                     )
                     if oos_r["score"] <= -1e8 or oos_r["profit_factor"] < GLOBAL["bt_oos_min_pf"]:
                         continue
-                    ratio = (oos_r["score"] / is_r["score"]) if is_r["score"] > 0 else 0.0
-                    if ratio < GLOBAL["bt_oos_min_ratio"]:
+                    if oos_r["max_dd"] > 0.25:
                         continue
-                    comb = 0.60 * is_r["score"] + 0.40 * oos_r["score"]
+                    comb = 0.55 * is_r["score"] + 0.45 * oos_r["score"]
                     if best is None or comb > best["comb"]:
                         best = {"comb": comb, "sl_mult": slm, "tp_mult": tpm, "threshold": th, "is": is_r, "oos": oos_r}
 
@@ -1707,12 +1749,12 @@ def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
     with open(PARAMS_PATH, "w", encoding="utf-8") as f:
         json.dump(calibrated, f, indent=2)
     if summary_lines:
-        send_telegram(f"📊 <b>Walk-Forward ({mode} v3.0)</b>\n" + "\n".join(summary_lines))
+        send_telegram(f"📊 <b>Walk-Forward ({mode} v3.1)</b>\n" + "\n".join(summary_lines))
     if plot_chart and curves and HAS_MPL:
         plt.figure(figsize=(10, 5))
         for name, c in curves.items():
             plt.plot(c, label=name)
-        plt.title(f"v3.0 Hardened MTF Backtest ({mode})")
+        plt.title(f"v3.1 Hardened MTF Backtest ({mode})")
         plt.xlabel("Trade #")
         plt.ylabel("Equity ($)")
         plt.legend(loc="best")
