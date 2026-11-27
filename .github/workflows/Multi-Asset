@@ -1,4 +1,4 @@
-name: Quant Multi-Asset Signal Bot v4.2
+name: Multi-Asset 
 
 on:
   schedule:
