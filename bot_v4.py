@@ -114,7 +114,7 @@ GLOBAL: Dict[str, Any] = {
     "bt_min_oos_trades_swing": 10,
     "bt_min_oos_pf": 1.18,
     "bt_max_oos_dd_pct": 15.0,
-    "tp1_partial_pct": 0.40,  # Lock 40% at TP1, trail 60% for big R winners
+    "tp1_partial_pct": 0.0,   # 0% early exit: TP1 moves SL to BE +0.05R & activates ATR trailing stop
     "be_buffer_r": 0.05,      # +0.05R buffer on breakeven SL to cover fees/slippage
     "error_cooldown_min": 60,
 }
@@ -153,13 +153,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 45,
             "max_entry_dev_atr": 0.45,
             "max_hold_bars": 40,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.35,
             "min_rr": 1.80,
             "min_atr_px": 1.2,
             "min_adx": 16.5,
-            "min_er": 0.21,
+            "min_er": 0.20,
             "max_chop": 59.0,
-            "min_score": 71,
+            "min_score": 68,
             "min_margin": 15,
         },
         "swing": {
@@ -170,13 +170,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 150,
             "max_entry_dev_atr": 0.65,
             "max_hold_bars": 84,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.40,
             "min_rr": 2.00,
             "min_atr_px": 3.0,
             "min_adx": 17.5,
-            "min_er": 0.20,
-            "max_chop": 60.0,
-            "min_score": 73,
+            "min_er": 0.21,
+            "max_chop": 58.0,
+            "min_score": 68,
             "min_margin": 16,
         },
     },
@@ -213,13 +213,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 45,
             "max_entry_dev_atr": 0.45,
             "max_hold_bars": 40,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.35,
             "min_rr": 1.80,
             "min_atr_px": 8.0,
             "min_adx": 16.5,
-            "min_er": 0.21,
+            "min_er": 0.20,
             "max_chop": 59.0,
-            "min_score": 71,
+            "min_score": 68,
             "min_margin": 15,
         },
         "swing": {
@@ -230,13 +230,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 150,
             "max_entry_dev_atr": 0.65,
             "max_hold_bars": 84,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.40,
             "min_rr": 2.00,
             "min_atr_px": 20.0,
             "min_adx": 17.5,
-            "min_er": 0.20,
-            "max_chop": 60.0,
-            "min_score": 73,
+            "min_er": 0.21,
+            "max_chop": 58.0,
+            "min_score": 68,
             "min_margin": 16,
         },
     },
@@ -277,13 +277,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 35,
             "max_entry_dev_atr": 0.45,
             "max_hold_bars": 40,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.35,
             "min_rr": 1.80,
             "min_atr_px": 30.0,
             "min_adx": 16.5,
-            "min_er": 0.21,
+            "min_er": 0.20,
             "max_chop": 59.0,
-            "min_score": 71,
+            "min_score": 68,
             "min_margin": 15,
         },
         "swing": {
@@ -294,13 +294,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 120,
             "max_entry_dev_atr": 0.65,
             "max_hold_bars": 84,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.40,
             "min_rr": 2.00,
             "min_atr_px": 80.0,
             "min_adx": 17.5,
-            "min_er": 0.20,
-            "max_chop": 60.0,
-            "min_score": 73,
+            "min_er": 0.21,
+            "max_chop": 58.0,
+            "min_score": 68,
             "min_margin": 16,
         },
     },
@@ -341,13 +341,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 35,
             "max_entry_dev_atr": 0.45,
             "max_hold_bars": 40,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.35,
             "min_rr": 1.80,
             "min_atr_px": 2.5,
             "min_adx": 16.5,
-            "min_er": 0.21,
+            "min_er": 0.20,
             "max_chop": 59.0,
-            "min_score": 71,
+            "min_score": 68,
             "min_margin": 15,
         },
         "swing": {
@@ -358,13 +358,13 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "stale_min": 120,
             "max_entry_dev_atr": 0.65,
             "max_hold_bars": 84,
-            "tp1_rr": 1.25,
+            "tp1_rr": 1.40,
             "min_rr": 2.00,
             "min_atr_px": 7.0,
             "min_adx": 17.5,
-            "min_er": 0.20,
-            "max_chop": 60.0,
-            "min_score": 73,
+            "min_er": 0.21,
+            "max_chop": 58.0,
+            "min_score": 68,
             "min_margin": 16,
         },
     },
@@ -1709,6 +1709,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     w["ema20"] = ema(c, 20)
     w["ema50"] = ema(c, 50)
     w["ema200"] = ema(c, 200)
+    w["ema20_slope"] = w["ema20"] - w["ema20"].shift(3)
     w["ema50_slope"] = w["ema50"] - w["ema50"].shift(4)
     w["atr"] = atr_series(w, 14)
     w["atr_med"] = w["atr"].rolling(100, min_periods=20).median().ffill().bfill()
@@ -1754,11 +1755,16 @@ def align_htf_to_ltf(ltf_df: pd.DataFrame, htf_df: pd.DataFrame, htf_tf: str) ->
     l = ltf_df.sort_values("timestamp").reset_index(drop=True)
     h = htf_df.sort_values("timestamp").copy()
     h["htf_avail_ts"] = h["timestamp"] + pd.to_timedelta(TF_SECONDS[htf_tf], unit="s")
-    cols = ["htf_avail_ts", "close", "ema50", "ema200", "ema50_slope", "adx", "rsi", "macd_hist", "struct_res", "struct_sup"]
+    cols = [
+        "htf_avail_ts", "close", "ema20", "ema50", "ema200",
+        "ema20_slope", "ema50_slope", "adx", "rsi", "macd_hist", "struct_res", "struct_sup",
+    ]
     h_sub = h[cols].rename(columns={
         "close": "h_close",
+        "ema20": "h_ema20",
         "ema50": "h_ema50",
         "ema200": "h_ema200",
+        "ema20_slope": "h_e20_slope",
         "ema50_slope": "h_slope",
         "adx": "h_adx",
         "rsi": "h_rsi",
@@ -1819,8 +1825,10 @@ def precompute_signals(
     vol_r = df["vol_ratio"].to_numpy(dtype=np.float64)
 
     hc = df["h_close"].to_numpy(dtype=np.float64)
+    he20 = df["h_ema20"].to_numpy(dtype=np.float64)
     he50 = df["h_ema50"].to_numpy(dtype=np.float64)
     he200 = df["h_ema200"].to_numpy(dtype=np.float64)
+    he20_sl = df["h_e20_slope"].to_numpy(dtype=np.float64)
     hsl = df["h_slope"].to_numpy(dtype=np.float64)
     hadx = df["h_adx"].to_numpy(dtype=np.float64)
     hrsi = df["h_rsi"].to_numpy(dtype=np.float64)
@@ -1835,6 +1843,10 @@ def precompute_signals(
     s_scores = np.zeros(n, dtype=np.int32)
     b_setups = np.empty(n, dtype=object)
     s_setups = np.empty(n, dtype=object)
+    b_pb_ok = np.zeros(n, dtype=bool)
+    s_pb_ok = np.zeros(n, dtype=bool)
+    b_brk_ok = np.zeros(n, dtype=bool)
+    s_brk_ok = np.zeros(n, dtype=bool)
     regimes = np.empty(n, dtype=object)
 
     min_atr = float(mcfg["min_atr_px"])
@@ -1847,7 +1859,7 @@ def precompute_signals(
         b_setups[i] = "NONE"
         s_setups[i] = "NONE"
 
-        if np.isnan(hc[i]) or np.isnan(he200[i]) or np.isnan(d_hi[i]) or np.isnan(atr_a[i]):
+        if np.isnan(hc[i]) or np.isnan(he50[i]) or np.isnan(d_hi[i]) or np.isnan(atr_a[i]):
             continue
         atr = atr_a[i]
         if atr < max(min_atr, atr_med[i] * 0.28):
@@ -1855,13 +1867,11 @@ def precompute_signals(
             continue
 
         rng = max(h[i] - l[i], EPSILON)
-        body = abs(c[i] - o[i])
-        body_ratio = body / rng
         close_pos = (c[i] - l[i]) / rng
 
-        # Regime classification
-        h_bull = (he50[i] > he200[i]) and (hc[i] > he50[i]) and (hsl[i] > 0)
-        h_bear = (he50[i] < he200[i]) and (hc[i] < he50[i]) and (hsl[i] < 0)
+        # Responsive HTF structural trend classification (zero 800-hour lag)
+        h_bull = (he20[i] > he50[i]) and (hc[i] > he20[i]) and (he20_sl[i] > 0)
+        h_bear = (he20[i] < he50[i]) and (hc[i] < he20[i]) and (he20_sl[i] < 0)
         quality_ok = (adx_a[i] >= min_adx) and (er_a[i] >= min_er) and (chop_a[i] <= max_chop)
         if not quality_ok:
             regimes[i] = "RANGE_CHOP"
@@ -1879,58 +1889,43 @@ def precompute_signals(
         # ------------------------------------------------------------------
         htf_b = 0.0
         htf_s = 0.0
-        if he50[i] > he200[i]:
-            htf_b += 12.0
-        elif he50[i] < he200[i]:
-            htf_s += 12.0
-        if hc[i] > he50[i]:
-            htf_b += 8.0
-        elif hc[i] < he50[i]:
-            htf_s += 8.0
-        if hsl[i] > 0:
-            htf_b += 6.0
-        elif hsl[i] < 0:
-            htf_s += 6.0
+        if h_bull:
+            htf_b += 25.0 if (not np.isnan(he200[i]) and he50[i] > he200[i]) else 18.0
+        elif h_bear:
+            htf_s += 25.0 if (not np.isnan(he200[i]) and he50[i] < he200[i]) else 18.0
+
         if hrsi[i] >= 52.0 and hmacd[i] > 0:
-            htf_b += 9.0
+            htf_b += 10.0
         elif hrsi[i] <= 48.0 and hmacd[i] < 0:
-            htf_s += 9.0
+            htf_s += 10.0
         elif hrsi[i] >= 50.0:
             htf_b += 4.0
         elif hrsi[i] <= 50.0:
             htf_s += 4.0
 
         # ------------------------------------------------------------------
-        # 2. LTF Trend Structure & Momentum (0 - 35 pts)
+        # 2. LTF Trend Structure & Momentum (0 - 37 pts)
         # ------------------------------------------------------------------
         ltf_b = 0.0
         ltf_s = 0.0
-        if c[i] > e20[i] > e50[i]:
-            ltf_b += 12.0
-        elif c[i] > e50[i]:
-            ltf_b += 6.0
-        if c[i] < e20[i] < e50[i]:
-            ltf_s += 12.0
-        elif c[i] < e50[i]:
-            ltf_s += 6.0
+        if e20[i] > e50[i]:
+            ltf_b += 14.0
+        elif e20[i] < e50[i]:
+            ltf_s += 14.0
 
-        if pdi_a[i] > mdi_a[i] and macd_a[i] > 0 and macd_a[i] >= macd_a[i - 1]:
+        if pdi_a[i] > mdi_a[i]:
             ltf_b += 10.0
-        elif pdi_a[i] > mdi_a[i]:
-            ltf_b += 5.0
-        if mdi_a[i] > pdi_a[i] and macd_a[i] < 0 and macd_a[i] <= macd_a[i - 1]:
-            ltf_s += 10.0
         elif mdi_a[i] > pdi_a[i]:
-            ltf_s += 5.0
+            ltf_s += 10.0
 
-        if adx_a[i] >= min_adx + 5.0:
+        if adx_a[i] >= min_adx + 4.0:
             ltf_b += 6.0
             ltf_s += 6.0
         elif adx_a[i] >= min_adx:
             ltf_b += 3.0
             ltf_s += 3.0
 
-        if er_a[i] >= 0.30:
+        if er_a[i] >= 0.28:
             ltf_b += 7.0
             ltf_s += 7.0
         elif er_a[i] >= min_er:
@@ -1938,25 +1933,15 @@ def precompute_signals(
             ltf_s += 4.0
 
         # ------------------------------------------------------------------
-        # 3. Trigger Setups & Candle Anatomy (0 - 30 pts)
-        # Empirically validated setups: Pullback Rejection, Squeeze Breakout, Liquidity Sweep
+        # 3. Trigger Setups (0 - 28 pts): PULLBACK_REJECTION & MOMENTUM_BREAKOUT
         # ------------------------------------------------------------------
-        recent_sq = bool(sq_a[i - 1] or sq_a[i - 2] or sq_a[i - 3] or sq_a[i - 4])
-        vol_boost = vol_r[i] >= 1.12
-
-        # Bull triggers
         ext_b = (c[i] - e20[i]) / max(atr, EPSILON)
-        bull_sq_brk = (
-            recent_sq
-            and (c[i] > d_hi[i])
-            and (c[i - 1] <= d_hi[i] * 1.0005)
-            and (close_pos >= 0.62)
-            and (body_ratio >= 0.38)
-            and (ext_b <= 1.80)
-        )
-        pullback_zone_b = (l[i] <= e20[i] + 0.25 * atr) or (l[i - 1] <= e20[i - 1] + 0.20 * atr) or (l[i] <= vwap_a[i] + 0.20 * atr)
+        pullback_zone_b = (l[i] <= e20[i] + 0.25 * atr) or (l[i - 1] <= e20[i - 1] + 0.20 * atr)
         bull_pb = (
-            (c[i] > e50[i])
+            h_bull
+            and (e20[i] > e50[i])
+            and (pdi_a[i] > mdi_a[i])
+            and (c[i] > e50[i])
             and pullback_zone_b
             and (c[i] > o[i])
             and (close_pos >= 0.60)
@@ -1964,39 +1949,32 @@ def precompute_signals(
             and (38.0 <= rsi_a[i] <= 66.0)
             and (rsi_a[i] > rsi_a[i - 1])
         )
-        prev_10_lo = float(np.min(l[i - 10:i]))
-        bull_sweep = (
-            (c[i] > e200[i])
-            and (l[i] < prev_10_lo)
-            and (c[i] > prev_10_lo)
-            and (close_pos >= 0.65)
-            and (rsi_a[i] < 60.0)
+        bull_brk = (
+            h_bull
+            and (e20[i] > e50[i])
+            and (c[i] > d_hi[i])
+            and (c[i - 1] <= d_hi[i])
+            and (close_pos >= 0.60)
+            and (ext_b <= 2.20)
         )
+        b_pb_ok[i] = bool(bull_pb)
+        b_brk_ok[i] = bool(bull_brk)
 
         trig_b = 0.0
         if bull_pb:
-            trig_b = 22.0 + (5.0 if close_pos >= 0.72 else 2.0) + (3.0 if vol_boost else 0.0)
+            trig_b = 25.0 + (3.0 if close_pos >= 0.72 else 0.0)
             b_setups[i] = "PULLBACK_REJECTION"
-        elif bull_sq_brk:
-            trig_b = 21.0 + (4.0 if vol_boost else 0.0) + (3.0 if close_pos >= 0.72 else 0.0)
-            b_setups[i] = "SQUEEZE_BREAKOUT"
-        elif bull_sweep:
-            trig_b = 20.0 + (4.0 if close_pos >= 0.75 else 0.0)
-            b_setups[i] = "LIQUIDITY_SWEEP"
+        elif bull_brk:
+            trig_b = 25.0 + (3.0 if close_pos >= 0.72 else 0.0)
+            b_setups[i] = "MOMENTUM_BREAKOUT"
 
-        # Bear triggers
         ext_s = (e20[i] - c[i]) / max(atr, EPSILON)
-        bear_sq_brk = (
-            recent_sq
-            and (c[i] < d_lo[i])
-            and (c[i - 1] >= d_lo[i] * 0.9995)
-            and (close_pos <= 0.38)
-            and (body_ratio >= 0.38)
-            and (ext_s <= 1.80)
-        )
-        pullback_zone_s = (h[i] >= e20[i] - 0.25 * atr) or (h[i - 1] >= e20[i - 1] - 0.20 * atr) or (h[i] >= vwap_a[i] - 0.20 * atr)
+        pullback_zone_s = (h[i] >= e20[i] - 0.25 * atr) or (h[i - 1] >= e20[i - 1] - 0.20 * atr)
         bear_pb = (
-            (c[i] < e50[i])
+            h_bear
+            and (e20[i] < e50[i])
+            and (mdi_a[i] > pdi_a[i])
+            and (c[i] < e50[i])
             and pullback_zone_s
             and (c[i] < o[i])
             and (close_pos <= 0.40)
@@ -2004,25 +1982,24 @@ def precompute_signals(
             and (34.0 <= rsi_a[i] <= 62.0)
             and (rsi_a[i] < rsi_a[i - 1])
         )
-        prev_10_hi = float(np.max(h[i - 10:i]))
-        bear_sweep = (
-            (c[i] < e200[i])
-            and (h[i] > prev_10_hi)
-            and (c[i] < prev_10_hi)
-            and (close_pos <= 0.35)
-            and (rsi_a[i] > 40.0)
+        bear_brk = (
+            h_bear
+            and (e20[i] < e50[i])
+            and (c[i] < d_lo[i])
+            and (c[i - 1] >= d_lo[i])
+            and (close_pos <= 0.40)
+            and (ext_s <= 2.20)
         )
+        s_pb_ok[i] = bool(bear_pb)
+        s_brk_ok[i] = bool(bear_brk)
 
         trig_s = 0.0
         if bear_pb:
-            trig_s = 22.0 + (5.0 if close_pos <= 0.28 else 2.0) + (3.0 if vol_boost else 0.0)
+            trig_s = 25.0 + (3.0 if close_pos <= 0.28 else 0.0)
             s_setups[i] = "PULLBACK_REJECTION"
-        elif bear_sq_brk:
-            trig_s = 21.0 + (4.0 if vol_boost else 0.0) + (3.0 if close_pos <= 0.28 else 0.0)
-            s_setups[i] = "SQUEEZE_BREAKOUT"
-        elif bear_sweep:
-            trig_s = 20.0 + (4.0 if close_pos <= 0.25 else 0.0)
-            s_setups[i] = "LIQUIDITY_SWEEP"
+        elif bear_brk:
+            trig_s = 25.0 + (3.0 if close_pos <= 0.28 else 0.0)
+            s_setups[i] = "MOMENTUM_BREAKOUT"
 
         # ------------------------------------------------------------------
         # 4. Hard Safety Vetoes (Strict HTF Trend Alignment & Anti-Exhaustion)
@@ -2030,9 +2007,9 @@ def precompute_signals(
         sb = int(round(min(100.0, htf_b + ltf_b + trig_b)))
         ss = int(round(min(100.0, htf_s + ltf_s + trig_s)))
 
-        if b_setups[i] == "NONE" or (not h_bull) or (rsi_a[i] > 72.0) or (vz_a[i] > 2.3) or (ext_b > 2.2):
+        if b_setups[i] == "NONE" or (not h_bull) or (rsi_a[i] > 74.0) or (vz_a[i] > 2.5) or (ext_b > 2.3):
             sb = min(sb, 45)
-        if s_setups[i] == "NONE" or (not h_bear) or (rsi_a[i] < 28.0) or (vz_a[i] < -2.3) or (ext_s > 2.2):
+        if s_setups[i] == "NONE" or (not h_bear) or (rsi_a[i] < 26.0) or (vz_a[i] < -2.5) or (ext_s > 2.3):
             ss = min(ss, 45)
 
         b_scores[i] = sb
@@ -2057,6 +2034,10 @@ def precompute_signals(
         "s_scores": s_scores,
         "b_setups": b_setups,
         "s_setups": s_setups,
+        "b_pb_ok": b_pb_ok,
+        "s_pb_ok": s_pb_ok,
+        "b_brk_ok": b_brk_ok,
+        "s_brk_ok": s_brk_ok,
         "regimes": regimes,
         "sess_ok": sess_ok,
         "timestamps": np.array(ts_list, dtype=object),
@@ -2097,18 +2078,14 @@ def compute_sl_tp_levels(
     tp2_r: float,
 ) -> Dict[str, float]:
     mcfg = INSTRUMENTS[inst][mode]
+    sl_dist = max(0.95 * atr, sl_mult * atr)
     if direction == "BUY":
-        raw_sl = min(entry - sl_mult * atr, sw_lo - 0.25 * atr) if not np.isnan(sw_lo) else (entry - sl_mult * atr)
-        # Clamp SL distance between 0.9 ATR and 2.5 ATR
-        sl_dist = max(0.95 * atr, min(2.50 * atr, entry - raw_sl))
         sl = round_price(inst, entry - sl_dist)
         sl_dist = abs(entry - sl)
         tp1 = round_price(inst, entry + mcfg["tp1_rr"] * sl_dist)
         tp2 = round_price(inst, entry + tp2_r * sl_dist)
         tp3 = round_price(inst, entry + (tp2_r + 0.8) * sl_dist)
     else:
-        raw_sl = max(entry + sl_mult * atr, sw_hi + 0.25 * atr) if not np.isnan(sw_hi) else (entry + sl_mult * atr)
-        sl_dist = max(0.95 * atr, min(2.50 * atr, raw_sl - entry))
         sl = round_price(inst, entry + sl_dist)
         sl_dist = abs(sl - entry)
         tp1 = round_price(inst, entry - mcfg["tp1_rr"] * sl_dist)
@@ -2148,7 +2125,8 @@ def backtest_slice(
     sl_mult: float,
     tp2_r: float,
     min_score: int,
-    trail_mult: float = 1.8,
+    trail_mult: float = 1.5,
+    setup_policy: str = "BOTH",
 ) -> Dict[str, Any]:
     cfg = INSTRUMENTS[inst]
     mcfg = cfg[mode]
@@ -2160,12 +2138,12 @@ def backtest_slice(
     atr_a = cache["atr"]
     sw_lo = cache["sw_lo"]
     sw_hi = cache["sw_hi"]
-    hres = cache["hres"]
-    hsup = cache["hsup"]
     b_scores = cache["b_scores"]
     s_scores = cache["s_scores"]
-    b_setups = cache["b_setups"]
-    s_setups = cache["s_setups"]
+    b_pb_ok = cache["b_pb_ok"]
+    s_pb_ok = cache["s_pb_ok"]
+    b_brk_ok = cache["b_brk_ok"]
+    s_brk_ok = cache["s_brk_ok"]
     sess_ok = cache["sess_ok"]
 
     min_margin = int(mcfg["min_margin"])
@@ -2263,10 +2241,19 @@ def backtest_slice(
             if atr <= EPSILON or np.isnan(atr):
                 continue
 
+            allow_b = (
+                bool(b_pb_ok[t]) if setup_policy == "PULLBACK"
+                else (bool(b_brk_ok[t]) if setup_policy == "BREAKOUT" else bool(b_pb_ok[t] or b_brk_ok[t]))
+            )
+            allow_s = (
+                bool(s_pb_ok[t]) if setup_policy == "PULLBACK"
+                else (bool(s_brk_ok[t]) if setup_policy == "BREAKOUT" else bool(s_pb_ok[t] or s_brk_ok[t]))
+            )
+
             direction = None
-            if sb >= min_score and (sb - ss) >= min_margin and b_setups[t] != "NONE":
+            if allow_b and sb >= min_score and (sb - ss) >= min_margin:
                 direction = "BUY"
-            elif ss >= min_score and (ss - sb) >= min_margin and s_setups[t] != "NONE":
+            elif allow_s and ss >= min_score and (ss - sb) >= min_margin:
                 direction = "SELL"
 
             if direction is None:
@@ -2277,12 +2264,6 @@ def backtest_slice(
             entry_eff = (entry_raw + half_cost_px) if direction == "BUY" else (entry_raw - half_cost_px)
             lvls = compute_sl_tp_levels(inst, mode, direction, entry_eff, atr, sw_lo[t], sw_hi[t], sl_mult, tp2_r)
             sl_dist = lvls["sl_dist"]
-
-            # Room-to-run check vs HTF structure
-            if direction == "BUY" and not np.isnan(hres[t]) and (hres[t] - entry_eff) < 0.75 * sl_dist:
-                continue
-            if direction == "SELL" and not np.isnan(hsup[t]) and (entry_eff - hsup[t]) < 0.75 * sl_dist:
-                continue
 
             lot, risk_usd = calc_lot_and_risk(inst, mode, entry_eff, lvls["sl"])
             # Realistic total cost in R: entry half_cost_px is in entry_eff; add exit half_cost_px + round-trip commission
@@ -2322,9 +2303,9 @@ def backtest_slice(
 
 def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
-    sl_grid = [1.5, 1.8, 2.0]
+    sl_grid = [1.8, 2.0]
     tp2_grid = [2.2, 2.5, 2.8]
-    score_grid = [68, 72, 75]
+    score_grid = [68, 72]
 
     for inst, cfg in INSTRUMENTS.items():
         for mode in ("scalp", "swing"):
@@ -2341,31 +2322,53 @@ def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dic
             n = len(df_l)
             is_end = int(n * 0.65)
             min_oos_t = GLOBAL["bt_min_oos_trades_scalp"] if mode == "scalp" else GLOBAL["bt_min_oos_trades_swing"]
+            trail_m = 1.5 if mode == "scalp" else 1.6
+            setup_grid = ["PULLBACK"] if mode == "scalp" else ["BREAKOUT", "PULLBACK"]
 
             best_score = -1e9
-            best_params = {"sl_mult": 1.8, "tp2_r": 2.5, "min_score": mcfg["min_score"], "trail_mult": 1.8}
+            best_params: Dict[str, Any] = {
+                "setup_policy": setup_grid[0],
+                "sl_mult": 1.8,
+                "tp2_r": 2.4,
+                "min_score": mcfg["min_score"],
+                "trail_mult": trail_m,
+            }
             best_is = None
 
-            for sl_m in sl_grid:
-                for tp2_m in tp2_grid:
-                    for sc_m in score_grid:
-                        res_is = backtest_slice(inst, mode, cache, 65, is_end, sl_m, tp2_m, sc_m, 1.8)
-                        if res_is["trades"] < GLOBAL["bt_min_is_trades"]:
-                            continue
-                        obj = res_is["total_r"] + 2.5 * (res_is["pf"] - 1.0) - 0.5 * res_is["max_dd"]
-                        if obj > best_score:
-                            best_score = obj
-                            best_params = {"sl_mult": sl_m, "tp2_r": tp2_m, "min_score": sc_m, "trail_mult": 1.8}
-                            best_is = res_is
+            for sp_m in setup_grid:
+                for sl_m in sl_grid:
+                    for tp2_m in tp2_grid:
+                        for sc_m in score_grid:
+                            res_is = backtest_slice(inst, mode, cache, 65, is_end, sl_m, tp2_m, sc_m, trail_m, sp_m)
+                            if res_is["trades"] < GLOBAL["bt_min_is_trades"]:
+                                continue
+                            obj = res_is["total_r"] + 2.5 * (res_is["pf"] - 1.0) - 0.5 * res_is["max_dd"]
+                            if obj > best_score:
+                                best_score = obj
+                                best_params = {
+                                    "setup_policy": sp_m,
+                                    "sl_mult": sl_m,
+                                    "tp2_r": tp2_m,
+                                    "min_score": sc_m,
+                                    "trail_mult": trail_m,
+                                }
+                                best_is = res_is
 
             if best_is is None:
-                best_is = backtest_slice(inst, mode, cache, 65, is_end, 1.8, 2.5, 68, 1.8)
-                best_params = {"sl_mult": 1.8, "tp2_r": 2.5, "min_score": 68, "trail_mult": 1.8}
+                best_is = backtest_slice(inst, mode, cache, 65, is_end, 1.8, 2.4, 68, trail_m, setup_grid[0])
+                best_params = {
+                    "setup_policy": setup_grid[0],
+                    "sl_mult": 1.8,
+                    "tp2_r": 2.4,
+                    "min_score": 68,
+                    "trail_mult": trail_m,
+                }
 
             # Combined OOS metrics
             res_oos_full = backtest_slice(
                 inst, mode, cache, is_end, n,
-                best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"], best_params["trail_mult"]
+                best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"],
+                best_params["trail_mult"], best_params["setup_policy"],
             )
 
             # 3-Fold Anchored Walk-Forward OOS validation with adaptive fold trade minimum
@@ -2380,7 +2383,8 @@ def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dic
                     continue
                 res_f = backtest_slice(
                     inst, mode, cache, f_s, f_e,
-                    best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"], best_params["trail_mult"]
+                    best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"],
+                    best_params["trail_mult"], best_params["setup_policy"],
                 )
                 if res_f["trades"] >= min_fold_t and res_f["pf"] >= 1.10 and res_f["total_r"] > 0 and res_f["max_dd"] < GLOBAL["bt_max_oos_dd_pct"]:
                     oos_folds_passed += 1
@@ -2550,17 +2554,27 @@ def evaluate_live_instrument(
     params = cal["params"]
     min_score = int(params["min_score"])
     min_margin = int(mcfg["min_margin"])
+    setup_policy = str(params.get("setup_policy", "BOTH"))
+
+    allow_b = (
+        bool(cache["b_pb_ok"][idx]) if setup_policy == "PULLBACK"
+        else (bool(cache["b_brk_ok"][idx]) if setup_policy == "BREAKOUT" else bool(cache["b_pb_ok"][idx] or cache["b_brk_ok"][idx]))
+    )
+    allow_s = (
+        bool(cache["s_pb_ok"][idx]) if setup_policy == "PULLBACK"
+        else (bool(cache["s_brk_ok"][idx]) if setup_policy == "BREAKOUT" else bool(cache["s_pb_ok"][idx] or cache["s_brk_ok"][idx]))
+    )
 
     direction = None
     setup = "NONE"
     score = max(sb, ss)
-    if sb >= min_score and (sb - ss) >= min_margin and cache["b_setups"][idx] != "NONE":
+    if allow_b and sb >= min_score and (sb - ss) >= min_margin:
         direction = "BUY"
-        setup = str(cache["b_setups"][idx])
+        setup = "PULLBACK_REJECTION" if (setup_policy == "PULLBACK" or (setup_policy == "BOTH" and cache["b_pb_ok"][idx])) else "MOMENTUM_BREAKOUT"
         score = sb
-    elif ss >= min_score and (ss - sb) >= min_margin and cache["s_setups"][idx] != "NONE":
+    elif allow_s and ss >= min_score and (ss - sb) >= min_margin:
         direction = "SELL"
-        setup = str(cache["s_setups"][idx])
+        setup = "PULLBACK_REJECTION" if (setup_policy == "PULLBACK" or (setup_policy == "BOTH" and cache["s_pb_ok"][idx])) else "MOMENTUM_BREAKOUT"
         score = ss
 
     if direction is None:
@@ -2593,11 +2607,6 @@ def evaluate_live_instrument(
         float(cache["sw_lo"][idx]), float(cache["sw_hi"][idx]),
         float(params["sl_mult"]), float(params["tp2_r"]),
     )
-    hres, hsup = float(cache["hres"][idx]), float(cache["hsup"][idx])
-    if direction == "BUY" and not np.isnan(hres) and (hres - live_px) < 0.75 * lvls["sl_dist"]:
-        return {"status": "SKIP", "reason": "NO_ROOM_TO_RESISTANCE"}
-    if direction == "SELL" and not np.isnan(hsup) and (live_px - hsup) < 0.75 * lvls["sl_dist"]:
-        return {"status": "SKIP", "reason": "NO_ROOM_TO_SUPPORT"}
 
     lot, risk_usd = calc_lot_and_risk(inst, mode, live_px, lvls["sl"])
     cap_ok, cap_reason = correlation_cap_ok(conn, inst, risk_usd)
@@ -2643,6 +2652,11 @@ def format_signal_html(sig: Dict[str, Any]) -> str:
     m_tag = "⚡ SCALPING" if sig["mode"] == "scalp" else "🌊 SWING"
     risk_pct = GLOBAL["risk_pct_scalping"] if sig["mode"] == "scalp" else GLOBAL["risk_pct_swing"]
     cal = sig["cal"]
+    tp1_label = (
+        f"BE +{GLOBAL['be_buffer_r']:.2f}R & Trail"
+        if GLOBAL["tp1_partial_pct"] <= 0
+        else f"{int(GLOBAL['tp1_partial_pct'] * 100)}% + BE +{GLOBAL['be_buffer_r']:.2f}R"
+    )
     return (
         f"🎯 <b>{html.escape(inst)} — {d_emoji}</b> ({m_tag})\n"
         f"📊 Setup: <code>{html.escape(sig['setup'])}</code> | Regime: <code>{html.escape(sig['regime'])}</code>\n"
@@ -2651,7 +2665,7 @@ def format_signal_html(sig: Dict[str, Any]) -> str:
         f"💵 <b>Entry Live:</b> <code>{fmt_price(inst, sig['entry'])}</code>\n"
         f"📌 Valid Zone: <code>{fmt_price(inst, sig['valid_min'])} – {fmt_price(inst, sig['valid_max'])}</code>\n"
         f"🛑 <b>Stop Loss:</b> <code>{fmt_price(inst, sig['sl'])}</code>\n"
-        f"🎯 <b>TP1 ({int(GLOBAL['tp1_partial_pct'] * 100)}% + BE +{GLOBAL['be_buffer_r']:.2f}R):</b> <code>{fmt_price(inst, sig['tp1'])}</code>\n"
+        f"🎯 <b>TP1 ({tp1_label}):</b> <code>{fmt_price(inst, sig['tp1'])}</code>\n"
         f"🎯 <b>TP2 (Trail Exit):</b> <code>{fmt_price(inst, sig['tp2'])}</code>\n"
         f"🚀 <b>TP3 (Extended):</b> <code>{fmt_price(inst, sig['tp3'])}</code>\n"
         f"────────────────────\n"
@@ -2800,9 +2814,13 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
             )
             conn.commit()
             if tp1_just_hit:
+                tp1_note = (
+                    f"ATR Trail Activated" if GLOBAL["tp1_partial_pct"] <= 0
+                    else f"{int(GLOBAL['tp1_partial_pct'] * 100)}% Profit Locked"
+                )
                 notify_all(
                     f"🎯 <b>TP1 HIT: {inst} ({mode.upper()} {direction})</b>\n"
-                    f"🔒 {int(GLOBAL['tp1_partial_pct'] * 100)}% Profit Locked | SL moved to BE+: <code>{fmt_price(inst, cur_sl)}</code>"
+                    f"🔒 {tp1_note} | SL moved to BE+: <code>{fmt_price(inst, cur_sl)}</code>"
                 )
 
 
