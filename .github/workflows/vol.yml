@@ -41,13 +41,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore SQLite state & Backtest Chart
+      - name: Restore SQLite state, Data Cache & Backtest Chart
         id: restore-state
         uses: actions/cache/restore@v4
         with:
           path: |
             trading_signals.db
             backtest_performance.png
+            data
           key: vol100-state-${{ github.run_id }}
           restore-keys: |
             vol100-state-
@@ -57,18 +58,22 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          VOL100_PRIMARY_FEED_URL: ${{ secrets.VOL100_PRIMARY_FEED_URL }}
+          VOL100_DERIV_APP_ID: ${{ secrets.VOL100_DERIV_APP_ID }}
+          VOL100_DERIV_SYMBOL: ${{ secrets.VOL100_DERIV_SYMBOL }}
           FORCE_BACKTEST: ${{ github.event.inputs.force_backtest || 'false' }}
           TZ: "UTC"
         run: |
           python bot.py
 
-      - name: Save SQLite state & Backtest Chart
+      - name: Save SQLite state, Data Cache & Backtest Chart
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             trading_signals.db
             backtest_performance.png
+            data
           key: vol100-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload Artifacts (DB, Chart & Forensic Log)
