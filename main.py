@@ -1,1560 +1,2904 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-==============================================================================
-AUTO TRADING SIGNAL BOT v4.0.0 — HARDENED QUANTITATIVE MULTI-ASSET ENGINE
-Instruments : XAUUSD, NAS100, BTCUSD, ETHUSD
-Modes       : SCALPING (1h HTF / 15m Entry), SWING (4h HTF / 1h Entry)
-CLI         : --mode live | --mode backtest | --mode both | --mode check
-Upgrades v4 :
-  1. Real-Time Cross-Feed Sanity (Coinbase + Binance/Kraken + Live Spread Guard)
-  2. Strict HTF/Entry Closed-Bar Timestamp Alignment (Zero Lookahead Parity)
-  3. Rolling VWAP +-2.2sigma + BB/KC Squeeze + Wick Rejection + Volume Filters
-  4. Overhead HTF Swing Clearance ("Room-to-Run" >= 1.15x ATR)
-  5. Partial TP1 (50% @ 1.0R + BE+Fee Lock) & Chandelier Trail (Live = Backtest)
-  6. Round-Trip Taker Commission Modeling + Dynamic Live Spread in Risk/Cost Gate
-  7. 3-Fold Anchored Walk-Forward + SQN + 500-Run Monte Carlo Stress Validator
-  8. Portfolio Correlation Cap (Crypto Bucket) + CME/CFD Rollover Blackout
-==============================================================================
+AUTO TRADING SIGNAL BOT v4.2.0 — ZERO-API-KEY MULTI-ASSET QUANT ENGINE
+Instruments: XAUUSD (Spot), NAS100 (NQ=F), BTCUSD (Spot), ETHUSD (Spot)
+Modes: SCALPING & SWING | CLI: --mode live | backtest | both | check
+Data Feeds (100% Free, Zero API Keys):
+  - Crypto (BTCUSD, ETHUSD): Kraken + Coinbase + OKX + Bitstamp + Deriv WS + Yahoo Crumb
+  - Gold (XAUUSD Spot): Deriv Public WS (frxXAUUSD) + Swissquote BBO + TradingView + Basis-Adj GC=F
+  - Nasdaq-100 (NAS100): Yahoo Direct Cookie/Crumb (NQ=F) + TradingView (CME_MINI:NQ1!) + yfinance
 """
-import os
-import sys
-import html
-import json
-import time
-import math
-import random
-import argparse
-import sqlite3
-import logging
-import traceback
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Optional, Any
 
+import matplotlib
+matplotlib.use("Agg")
+
+import argparse
+import base64
+import hashlib
+import html
+import http.cookiejar
+import json
+import logging
+import math
+import os
+import re
+import socket
+import sqlite3
+import ssl
+import struct
+import sys
+import time
+import traceback
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from io import StringIO
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, urlparse
+from zoneinfo import ZoneInfo
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import requests
 
 try:
-    import numpy as np
-    import pandas as pd
-    HAS_DATA_LIBS = True
-except Exception:
-    HAS_DATA_LIBS = False
-    np = None  # type: ignore
-    pd = None  # type: ignore
+    import websocket  # websocket-client
+except ImportError:
+    websocket = None
+
+try:
+    from websockets.sync.client import connect as ws_sync_connect
+except ImportError:
+    ws_sync_connect = None
 
 try:
     import yfinance as yf
-    HAS_YF = True
-except Exception:
-    HAS_YF = False
-    yf = None  # type: ignore
+except ImportError:
+    yf = None
 
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    HAS_MPL = True
-except Exception:
-    HAS_MPL = False
-    plt = None  # type: ignore
 
 # ==============================================================================
-# CENTRAL CONFIG
+# 0. CENTRALIZED CONFIGURATION & ENVIRONMENT
 # ==============================================================================
-DB_PATH     = os.getenv("BOT_DB_PATH", "trading_signals_v4.db")
-PARAMS_PATH = os.getenv("BOT_PARAMS_PATH", "calibrated_params_v4.json")
-CHART_PATH  = os.getenv("BOT_CHART_PATH", "backtest_performance_v4.png")
+BOT_VERSION = "4.2.0"
 
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TZ_UTC = timezone.utc
+TZ_NY = ZoneInfo("America/New_York")
+TZ_LDN = ZoneInfo("Europe/London")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-TWELVEDATA_API_KEY  = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
-NY_TZ  = ZoneInfo("America/New_York")
-LDN_TZ = ZoneInfo("Europe/London")
+# Strictly optional legacy bonus feed; bot works 100% with zero API keys
+TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
-ACCOUNT = {
-    "balance":             float(os.getenv("BOT_BALANCE", "10000.0")),
-    "risk_pct_scalp":      float(os.getenv("BOT_RISK_SCALP", "0.50")),
-    "risk_pct_swing":      float(os.getenv("BOT_RISK_SWING", "0.75")),
-    "max_corr_bucket_risk": float(os.getenv("BOT_MAX_BUCKET_RISK", "1.00")),
-}
+DERIV_PUBLIC_WS_URL = os.getenv(
+    "DERIV_PUBLIC_WS_URL",
+    "wss://api.derivws.com/trading/v1/options/ws/public",
+).strip()
+DERIV_LEGACY_WS_URLS = [
+    "wss://ws.derivws.com/websockets/v3",
+    "wss://frontend.derivws.com/websockets/v3",
+    "wss://red.derivws.com/websockets/v3",
+]
+DERIV_ORIGIN = os.getenv("DERIV_ORIGIN", "https://app.deriv.com").strip()
 
-GLOBAL = {
-    "min_score_signal":      70,
-    "donchian_bars":         20,
-    "bos_fresh_max_bars":    12,
-    "rsi_max_buy":           70.0,
-    "rsi_min_sell":          30.0,
-    "mad_z_max_abs":         3.0,
-    "vwap_z_max_abs":        2.2,
-    "max_candle_atr":        2.6,
-    "max_dist_ema20_atr":    2.1,
-    "max_wick_ratio":        0.42,
-    "min_room_swing_atr":    1.15,
-    "min_atr_cost_mult":     2.0,
-    "max_spread_mult":       2.8,
-    "max_cross_div_bps":     35.0,
-    "stale_max_min":         {"1m": 10, "5m": 20, "15m": 45, "1h": 180, "4h": 480},
-    "closed_stale_extra_min": 5 * 24 * 60,
-    "spike_mad_threshold":   9.0,
-    "spread_pts":   {"XAUUSD": 0.35, "NAS100": 1.5, "BTCUSD": 12.0, "ETHUSD": 1.0},
-    "slippage_pts": {"XAUUSD": 0.15, "NAS100": 0.5, "BTCUSD":  5.0, "ETHUSD": 0.4},
-    "taker_fee_bps": {"XAUUSD": 0.0, "NAS100": 0.0, "BTCUSD":  5.0, "ETHUSD": 5.0},
-    # Walk-Forward & Monte Carlo thresholds
-    "bt_risk_pct":           0.005,
-    "bt_min_equity":         2000.0,
-    "bt_max_dd_stop":        0.30,
-    "bt_min_fold_trades":    5,
-    "bt_min_profit_factor":  1.05,
-    "mc_runs":               500,
-    "mc_min_prob_profit":    0.55,
+DB_PATH = os.getenv("SQLITE_DB_PATH", "signals_v4.db")
+CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
+LOCAL_DATA_DIR = os.getenv("LOCAL_DATA_DIR", "data")
+AUDIT_LOG_FILE = os.getenv("FORENSIC_AUDIT_LOG", "forensic_audit_v4.log")
+
+FORCE_BACKTEST = os.getenv("FORCE_BACKTEST", "false").lower() == "true"
+FORCE_CHECK = os.getenv("FORCE_CHECK", "false").lower() == "true"
+HTTP_TIMEOUT_SEC = int(os.getenv("HTTP_TIMEOUT_SEC", "10"))
+EPSILON = 1e-9
+
+GLOBAL: Dict[str, Any] = {
+    "balance": float(os.getenv("ACCOUNT_BALANCE", "1000.0")),
+    "risk_pct_scalping": float(os.getenv("RISK_PCT_SCALPING", "1.0")),
+    "risk_pct_swing": float(os.getenv("RISK_PCT_SWING", "1.5")),
+    "max_open_trades": int(os.getenv("MAX_OPEN_TRADES", "4")),
+    "max_bucket_risk_pct": float(os.getenv("MAX_BUCKET_RISK_PCT", "2.0")),
+    "scalp_cooldown_min": 45,
+    "swing_cooldown_min": 240,
+    "anti_flip_scalp_min": 90,
+    "anti_flip_swing_min": 480,
+    "bt_refresh_hours": 12,
+    "bt_min_fold_trades_scalp": 4,
+    "bt_min_fold_trades_swing": 3,
+    "bt_min_is_trades": 10,
+    "bt_min_oos_pf": 1.20,
+    "bt_max_oos_dd_pct": 14.0,
+    "be_buffer_r": 0.05,  # +0.05R buffer on breakeven SL to cover fees/slippage
+    "error_cooldown_min": 60,
 }
 
 INSTRUMENTS: Dict[str, Dict[str, Any]] = {
     "XAUUSD": {
-        "source_groups": [
-            {"name": "twelvedata_xau", "type": "twelvedata", "symbol": "XAU/USD",  "multiplier": 1.0, "offset": 0.0},
-            {"name": "yahoo_xauusd",   "type": "yfinance",   "symbol": "XAUUSD=X", "multiplier": 1.0, "offset": 0.0},
-            {"name": "yahoo_gcf",      "type": "yfinance",   "symbol": "GC=F",     "multiplier": 1.0, "offset": 0.0},
-        ],
+        "name": "Gold Spot (XAU/USD)",
+        "asset_class": "forex_metal",
+        "corr_bucket": "METALS_RATES",
+        "deriv_sym": "frxXAUUSD",
+        "yf": "GC=F",
+        "td": "XAU/USD",
+        "tv_market": "cfd",
+        "tv_tickers": ["OANDA:XAUUSD", "FX_IDC:XAUUSD"],
         "contract": {
-            "pip_value_per_lot": float(os.getenv("XAU_PIP_VALUE", "100.0")),
-            "min_lot": 0.01, "max_lot": 5.0, "lot_step": 0.01, "decimals": 2,
+            "lot_unit": 100.0,
+            "lot_min": 0.01,
+            "lot_step": 0.01,
+            "lot_max": 20.0,
+            "decimals": 2,
+            "tick": 0.01,
+            "pip": 0.10,
         },
-        "session_filter": True,
-        "kind": "commodity",
-        "corr_bucket": "METALS",
+        "costs": {
+            "spread_px": 0.35,
+            "slip_px": 0.15,
+            "comm_rt_per_lot": 6.0,
+            "max_spread_atr": 0.18,
+            "max_exch_div_pct": 0.45,
+        },
+        "scalp": {
+            "ltf": "15m",
+            "htf": "1h",
+            "ltf_min": 180,
+            "htf_min": 120,
+            "stale_min": 45,
+            "max_entry_dev_atr": 0.45,
+            "max_hold_bars": 28,
+            "tp1_rr": 1.0,
+            "min_rr": 1.65,
+            "min_atr_px": 1.2,
+            "min_adx": 16.5,
+            "min_er": 0.21,
+            "max_chop": 59.0,
+            "min_score": 71,
+            "min_margin": 15,
+        },
+        "swing": {
+            "ltf": "1h",
+            "htf": "4h",
+            "ltf_min": 200,
+            "htf_min": 90,
+            "stale_min": 150,
+            "max_entry_dev_atr": 0.65,
+            "max_hold_bars": 42,
+            "tp1_rr": 1.0,
+            "min_rr": 1.90,
+            "min_atr_px": 3.0,
+            "min_adx": 17.5,
+            "min_er": 0.20,
+            "max_chop": 60.0,
+            "min_score": 73,
+            "min_margin": 16,
+        },
     },
     "NAS100": {
-        "source_groups": [
-            {"name": "twelvedata_ndx", "type": "twelvedata", "symbol": "NDX",  "multiplier": 1.0, "offset": 0.0},
-            {"name": "yahoo_nq",       "type": "yfinance",   "symbol": "NQ=F", "multiplier": 1.0, "offset": 0.0},
-            {"name": "yahoo_ndx",      "type": "yfinance",   "symbol": "^NDX", "multiplier": 1.0, "offset": 0.0},
-        ],
+        "name": "Nasdaq-100 E-Mini (NQ=F)",
+        "asset_class": "index",
+        "corr_bucket": "RISK_ON",
+        "deriv_sym": None,
+        "yf": "NQ=F",
+        "td": "NDX",
+        "tv_market": "futures",
+        "tv_tickers": ["CME_MINI:NQ1!"],
         "contract": {
-            "pip_value_per_lot": float(os.getenv("NAS100_PIP_VALUE", "1.0")),
-            "min_lot": 0.01, "max_lot": 10.0, "lot_step": 0.01, "decimals": 2,
+            "lot_unit": 20.0,
+            "lot_min": 0.01,
+            "lot_step": 0.01,
+            "lot_max": 20.0,
+            "decimals": 2,
+            "tick": 0.25,
+            "pip": 1.0,
         },
-        "session_filter": True,
-        "kind": "index",
-        "corr_bucket": "US_EQUITY",
+        "costs": {
+            "spread_px": 1.50,
+            "slip_px": 0.75,
+            "comm_rt_per_lot": 4.0,
+            "max_spread_atr": 0.16,
+            "max_exch_div_pct": 0.50,
+        },
+        "scalp": {
+            "ltf": "15m",
+            "htf": "1h",
+            "ltf_min": 180,
+            "htf_min": 120,
+            "stale_min": 45,
+            "max_entry_dev_atr": 0.45,
+            "max_hold_bars": 28,
+            "tp1_rr": 1.0,
+            "min_rr": 1.65,
+            "min_atr_px": 8.0,
+            "min_adx": 16.5,
+            "min_er": 0.21,
+            "max_chop": 59.0,
+            "min_score": 71,
+            "min_margin": 15,
+        },
+        "swing": {
+            "ltf": "1h",
+            "htf": "4h",
+            "ltf_min": 200,
+            "htf_min": 90,
+            "stale_min": 150,
+            "max_entry_dev_atr": 0.65,
+            "max_hold_bars": 42,
+            "tp1_rr": 1.0,
+            "min_rr": 1.90,
+            "min_atr_px": 20.0,
+            "min_adx": 17.5,
+            "min_er": 0.20,
+            "max_chop": 60.0,
+            "min_score": 73,
+            "min_margin": 16,
+        },
     },
     "BTCUSD": {
-        "source_groups": [
-            {"name": "coinbase_btc", "type": "coinbase", "symbol": "BTC-USD", "binance": "BTCUSDT", "multiplier": 1.0, "offset": 0.0},
-            {"name": "yahoo_btc",    "type": "yfinance", "symbol": "BTC-USD", "multiplier": 1.0, "offset": 0.0},
-        ],
+        "name": "Bitcoin Spot (BTC/USD)",
+        "asset_class": "crypto",
+        "corr_bucket": "RISK_ON",
+        "deriv_sym": "cryBTCUSD",
+        "kraken_pair": "XBTUSD",
+        "coinbase_pair": "BTC-USD",
+        "okx_inst": "BTC-USDT",
+        "bitstamp_pair": "btcusd",
+        "yf": "BTC-USD",
+        "td": "BTC/USD",
+        "tv_market": "crypto",
+        "tv_tickers": ["COINBASE:BTCUSD", "KRAKEN:BTCUSD"],
         "contract": {
-            "pip_value_per_lot": float(os.getenv("BTC_PIP_VALUE", "1.0")),
-            "min_lot": 0.01, "max_lot": 5.0, "lot_step": 0.01, "decimals": 2,
+            "lot_unit": 1.0,
+            "lot_min": 0.01,
+            "lot_step": 0.01,
+            "lot_max": 10.0,
+            "decimals": 2,
+            "tick": 0.01,
+            "pip": 1.0,
         },
-        "session_filter": False,
-        "kind": "crypto",
-        "corr_bucket": "CRYPTO_BETA",
+        "costs": {
+            "spread_px": 8.0,
+            "slip_px": 6.0,
+            "comm_rt_per_lot": 40.0,
+            "max_spread_atr": 0.14,
+            "max_exch_div_pct": 0.45,
+        },
+        "scalp": {
+            "ltf": "15m",
+            "htf": "1h",
+            "ltf_min": 180,
+            "htf_min": 120,
+            "stale_min": 35,
+            "max_entry_dev_atr": 0.45,
+            "max_hold_bars": 28,
+            "tp1_rr": 1.0,
+            "min_rr": 1.65,
+            "min_atr_px": 30.0,
+            "min_adx": 16.5,
+            "min_er": 0.21,
+            "max_chop": 59.0,
+            "min_score": 71,
+            "min_margin": 15,
+        },
+        "swing": {
+            "ltf": "1h",
+            "htf": "4h",
+            "ltf_min": 200,
+            "htf_min": 90,
+            "stale_min": 120,
+            "max_entry_dev_atr": 0.65,
+            "max_hold_bars": 42,
+            "tp1_rr": 1.0,
+            "min_rr": 1.90,
+            "min_atr_px": 80.0,
+            "min_adx": 17.5,
+            "min_er": 0.20,
+            "max_chop": 60.0,
+            "min_score": 73,
+            "min_margin": 16,
+        },
     },
     "ETHUSD": {
-        "source_groups": [
-            {"name": "coinbase_eth", "type": "coinbase", "symbol": "ETH-USD", "binance": "ETHUSDT", "multiplier": 1.0, "offset": 0.0},
-            {"name": "yahoo_eth",    "type": "yfinance", "symbol": "ETH-USD", "multiplier": 1.0, "offset": 0.0},
-        ],
+        "name": "Ethereum Spot (ETH/USD)",
+        "asset_class": "crypto",
+        "corr_bucket": "RISK_ON",
+        "deriv_sym": "cryETHUSD",
+        "kraken_pair": "ETHUSD",
+        "coinbase_pair": "ETH-USD",
+        "okx_inst": "ETH-USDT",
+        "bitstamp_pair": "ethusd",
+        "yf": "ETH-USD",
+        "td": "ETH/USD",
+        "tv_market": "crypto",
+        "tv_tickers": ["COINBASE:ETHUSD", "KRAKEN:ETHUSD"],
         "contract": {
-            "pip_value_per_lot": float(os.getenv("ETH_PIP_VALUE", "1.0")),
-            "min_lot": 0.01, "max_lot": 50.0, "lot_step": 0.01, "decimals": 2,
+            "lot_unit": 10.0,
+            "lot_min": 0.01,
+            "lot_step": 0.01,
+            "lot_max": 20.0,
+            "decimals": 2,
+            "tick": 0.01,
+            "pip": 0.10,
         },
-        "session_filter": False,
-        "kind": "crypto",
-        "corr_bucket": "CRYPTO_BETA",
+        "costs": {
+            "spread_px": 0.60,
+            "slip_px": 0.50,
+            "comm_rt_per_lot": 15.0,
+            "max_spread_atr": 0.14,
+            "max_exch_div_pct": 0.50,
+        },
+        "scalp": {
+            "ltf": "15m",
+            "htf": "1h",
+            "ltf_min": 180,
+            "htf_min": 120,
+            "stale_min": 35,
+            "max_entry_dev_atr": 0.45,
+            "max_hold_bars": 28,
+            "tp1_rr": 1.0,
+            "min_rr": 1.65,
+            "min_atr_px": 2.5,
+            "min_adx": 16.5,
+            "min_er": 0.21,
+            "max_chop": 59.0,
+            "min_score": 71,
+            "min_margin": 15,
+        },
+        "swing": {
+            "ltf": "1h",
+            "htf": "4h",
+            "ltf_min": 200,
+            "htf_min": 90,
+            "stale_min": 120,
+            "max_entry_dev_atr": 0.65,
+            "max_hold_bars": 42,
+            "tp1_rr": 1.0,
+            "min_rr": 1.90,
+            "min_atr_px": 7.0,
+            "min_adx": 17.5,
+            "min_er": 0.20,
+            "max_chop": 60.0,
+            "min_score": 73,
+            "min_margin": 16,
+        },
     },
 }
 
-TIMEFRAMES = {
-    "SCALPING": {
-        "htf": "1h", "entry": "15m", "htf_sec": 3600, "entry_sec": 900,
-        "period_htf": "60d", "period_entry": "15d",
-        "min_bars_htf": 160, "min_bars_entry": 160,
-        "sl_atr": 1.8, "trail_atr": 1.25, "be_trigger_r": 1.05, "tp1_r": 1.0,
-        "tp_atr": [1.8, 3.0, 4.2], "max_hold_bars": 40,
-        "cooldown_same_min": 60, "cooldown_flip_min": 120,
-    },
-    "SWING": {
-        "htf": "4h", "entry": "1h", "htf_sec": 14400, "entry_sec": 3600,
-        "period_htf": "90d", "period_entry": "90d",
-        "min_bars_htf": 160, "min_bars_entry": 240,
-        "sl_atr": 2.2, "trail_atr": 1.45, "be_trigger_r": 1.05, "tp1_r": 1.0,
-        "tp_atr": [2.2, 4.0, 5.5], "max_hold_bars": 96,
-        "cooldown_same_min": 120, "cooldown_flip_min": 240,
-    },
+TF_SECONDS: Dict[str, int] = {
+    "5m": 300,
+    "15m": 900,
+    "1h": 3600,
+    "4h": 14400,
 }
 
-COINBASE_GRAN = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "6h": 21600, "1d": 86400}
 
 # ==============================================================================
-# LOGGING, TIME & SESSION GUARDS (DST-EXACT + ROLLOVER BLACKOUT)
+# 1. LOGGING, FORMATTING & PRECISION HELPERS
 # ==============================================================================
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        stream=sys.stdout,
-    )
-    for noisy in ("yfinance", "urllib3", "peewee"):
-        logging.getLogger(noisy).setLevel(logging.CRITICAL)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(AUDIT_LOG_FILE, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("QUANT_BOT_V4")
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
 
-def now_utc_iso() -> str:
-    return now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+def utc_now() -> datetime:
+    return datetime.now(TZ_UTC)
 
-def _parse_ts(ts: Optional[str]) -> datetime:
-    if not ts:
-        return now_utc()
-    try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return now_utc()
 
-def _cme_futures_open(ny: datetime) -> bool:
-    wd = ny.weekday()
-    if wd == 5:
-        return False
-    if wd == 4 and ny.hour >= 17:
-        return False
-    if wd == 6 and ny.hour < 18:
-        return False
-    if ny.hour == 17:
-        return False
-    return True
+def utc_iso(dt: Optional[datetime] = None) -> str:
+    d = dt or utc_now()
+    return d.astimezone(TZ_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def rollover_blackout(inst: str, now: Optional[datetime] = None) -> bool:
-    if INSTRUMENTS[inst]["kind"] == "crypto":
-        return False
-    ny = (now or now_utc()).astimezone(NY_TZ)
-    mins = ny.hour * 60 + ny.minute
-    return (16 * 60 + 55) <= mins <= (18 * 60 + 5)
 
-def market_open(inst: str, now: Optional[datetime] = None, for_monitoring: bool = False,
-                mode: Optional[str] = None) -> bool:
-    kind = INSTRUMENTS[inst]["kind"]
-    if kind == "crypto":
-        return True
-    ref = now or now_utc()
-    ny = ref.astimezone(NY_TZ)
-    wd = ny.weekday()
-    mins = ny.hour * 60 + ny.minute
+def round_price(inst: str, val: float) -> float:
+    dec = int(INSTRUMENTS[inst]["contract"]["decimals"])
+    quant = Decimal(f"1e-{dec}") if dec > 0 else Decimal("1")
+    d = Decimal(f"{float(val):.{max(dec + 3, 8)}f}").quantize(quant, rounding=ROUND_HALF_UP)
+    return float(d)
 
-    if kind == "index":
-        if for_monitoring:
-            return _cme_futures_open(ny)
-        if mode == "SWING":
-            return (wd < 5) and (8 * 60 <= mins <= 16 * 60)
-        return (wd < 5) and (9 * 60 + 30 <= mins < 16 * 60)
 
-    if kind == "commodity":
-        return _cme_futures_open(ny)
-    return True
+def fmt_price(inst: str, val: float) -> str:
+    dec = int(INSTRUMENTS[inst]["contract"]["decimals"])
+    return f"{round_price(inst, val):.{dec}f}"
 
-def scalping_session_ok(inst: str, now: Optional[datetime] = None) -> bool:
-    if not INSTRUMENTS[inst]["session_filter"]:
-        return True
-    ref = now or now_utc()
-    if INSTRUMENTS[inst]["kind"] == "index":
-        return market_open(inst, ref, for_monitoring=False, mode="SCALPING")
-    ldn = ref.astimezone(LDN_TZ)
-    ny  = ref.astimezone(NY_TZ)
-    return market_open(inst, ref, for_monitoring=False, mode="SCALPING") and (ldn.hour >= 8) and (ny.hour < 14)
+
+def floor_lot(inst: str, raw_lot: float) -> float:
+    spec = INSTRUMENTS[inst]["contract"]
+    step = Decimal(str(spec["lot_step"]))
+    d = Decimal(f"{max(raw_lot, 0.0):.8f}")
+    stepped = (d / step).to_integral_value(rounding=ROUND_DOWN) * step
+    clamped = max(Decimal(str(spec["lot_min"])), min(Decimal(str(spec["lot_max"])), stepped))
+    return float(clamped.quantize(step, rounding=ROUND_DOWN))
+
 
 # ==============================================================================
-# REAL-TIME LIVE QUOTE & CROSS-EXCHANGE SPREAD SANITY
+# 2. HTTP POOL, RETRY BACKOFF & ALERTS
 # ==============================================================================
-def fetch_live_microstructure(inst: str) -> Dict[str, Any]:
-    """Fetch real-time bid/ask spread and cross-exchange reference price."""
-    default_sp = float(GLOBAL["spread_pts"].get(inst, 1.0))
-    out: Dict[str, Any] = {
-        "price": None, "bid": None, "ask": None,
-        "spread_pts": default_sp, "div_bps": 0.0, "source": "default",
-    }
-    try:
-        if inst in ("BTCUSD", "ETHUSD"):
-            cb_sym = "BTC-USD" if inst == "BTCUSD" else "ETH-USD"
-            bn_sym = "BTCUSDT" if inst == "BTCUSD" else "ETHUSDT"
-            r_cb = requests.get(
-                f"https://api.exchange.coinbase.com/products/{cb_sym}/ticker",
-                timeout=6, headers={"User-Agent": "signal-bot-v4/4.0.0"},
-            )
-            if r_cb.ok:
-                d = r_cb.json()
-                bid = float(d.get("bid", 0) or 0)
-                ask = float(d.get("ask", 0) or 0)
-                px  = float(d.get("price", 0) or 0)
-                if bid > 0 and ask >= bid and px > 0:
-                    out["price"], out["bid"], out["ask"] = px, bid, ask
-                    out["spread_pts"] = max(ask - bid, 0.01)
-                    out["source"] = f"coinbase:{cb_sym}"
-            try:
-                r_bn = requests.get(
-                    f"https://api.binance.com/api/v3/bookTicker?symbol={bn_sym}",
-                    timeout=5,
-                )
-                if r_bn.ok and out["price"]:
-                    bd = r_bn.json()
-                    bn_mid = 0.5 * (float(bd["bidPrice"]) + float(bd["askPrice"]))
-                    if bn_mid > 0:
-                        out["div_bps"] = abs(out["price"] - bn_mid) / bn_mid * 10000.0
-            except Exception:
-                pass
-    except Exception as e:
-        logging.debug(f"[microstructure] {inst}: {e}")
-    return out
+_HTTP = requests.Session()
+_HTTP.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+})
 
-# ==============================================================================
-# DATA FETCHERS (SOURCE-LOCKED + CLOSED-BAR FILTERED + TWELVEDATA OPTIONAL)
-# ==============================================================================
-def flatten_yf(df: Any) -> Any:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
 
-def fetch_yf(symbol: str, interval: str, period: str, min_bars: int) -> Optional[Any]:
-    if not HAS_YF or not HAS_DATA_LIBS:
-        return None
-    for attempt in range(2):
+def request_with_backoff(
+    method: str,
+    url: str,
+    max_retries: int = 3,
+    base_delay: float = 0.8,
+    timeout: int = HTTP_TIMEOUT_SEC,
+    **kwargs: Any,
+) -> requests.Response:
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries):
         try:
-            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-            if df is None or df.empty:
-                time.sleep(0.5)
-                continue
-            df = flatten_yf(df)
-            cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[cols].copy()
-            if "Volume" not in df.columns:
-                df["Volume"] = 0.0
-            df = df.dropna(subset=["Open", "High", "Low", "Close"])
-            if df.index.tzinfo is None:
-                df.index = df.index.tz_localize("UTC")
-            else:
-                df.index = df.index.tz_convert("UTC")
-            df = df[~df.index.duplicated(keep="last")].sort_index()
-            return df if len(df) >= min_bars else None
-        except Exception:
-            if attempt == 0:
-                time.sleep(0.6)
-    return None
+            resp = _HTTP.request(method, url, timeout=timeout, **kwargs)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                retry_after = resp.headers.get("Retry-After")
+                hint = f" (Retry-After={retry_after})" if retry_after else ""
+                raise requests.HTTPError(
+                    f"Transient HTTP {resp.status_code}{hint}: {resp.text[:160]}",
+                    response=resp,
+                )
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise RuntimeError(f"HTTP {method} {url} failed: {last_exc}")
 
-def fetch_twelvedata(symbol: str, interval: str, outputsize: int, min_bars: int) -> Optional[Any]:
-    if not TWELVEDATA_API_KEY or not HAS_DATA_LIBS:
-        return None
-    iv_map = {"15m": "15min", "1h": "1h", "4h": "4h"}
-    td_iv = iv_map.get(interval)
-    if not td_iv:
-        return None
+
+def tg_send(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": symbol, "interval": td_iv, "outputsize": min(outputsize, 5000),
-                "timezone": "UTC", "apikey": TWELVEDATA_API_KEY,
+        request_with_backoff(
+            "POST",
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
             },
-            timeout=15,
         )
-        if not r.ok:
-            return None
-        payload = r.json()
-        values = payload.get("values")
-        if not isinstance(values, list) or len(values) < min_bars:
-            return None
-        rows = []
-        for v in values:
-            rows.append({
-                "ts": pd.Timestamp(v["datetime"], tz="UTC"),
-                "Open": float(v["open"]), "High": float(v["high"]),
-                "Low": float(v["low"]), "Close": float(v["close"]),
-                "Volume": float(v.get("volume") or 0.0),
-            })
-        df = pd.DataFrame(rows).set_index("ts").sort_index()
-        df = df[~df.index.duplicated(keep="last")]
-        return df if len(df) >= min_bars else None
-    except Exception:
-        return None
-
-def fetch_coinbase(product: str, granularity: int, min_bars: int, max_batches: int = 2) -> Optional[Any]:
-    if not HAS_DATA_LIBS:
-        return None
-    try:
-        all_rows = []
-        end_dt = now_utc()
-        for b in range(max_batches):
-            if b > 0:
-                time.sleep(0.15 if max_batches > 4 else 0.05)
-            start_dt = pd.Timestamp(end_dt) - pd.Timedelta(seconds=granularity * 290)
-            url = (
-                f"https://api.exchange.coinbase.com/products/{product}/candles"
-                f"?granularity={granularity}"
-                f"&start={start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                f"&end={end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-            )
-            data = None
-            delay = 0.6
-            for _ in range(3):
-                try:
-                    r = requests.get(url, timeout=20, headers={"User-Agent": "signal-bot-v4/4.0.0"})
-                    if r.status_code == 429:
-                        time.sleep(delay)
-                        delay = min(delay * 2, 5.0)
-                        continue
-                    r.raise_for_status()
-                    data = r.json()
-                    break
-                except Exception:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 4.0)
-            if isinstance(data, list) and data:
-                all_rows.extend(data)
-            else:
-                break
-            end_dt = start_dt.to_pydatetime()
-            if max_batches <= 2 and len(all_rows) >= min_bars + 60:
-                break
-        if not all_rows:
-            return None
-        arr = sorted({row[0]: row for row in all_rows}.values(), key=lambda x: x[0])
-        df = pd.DataFrame(arr, columns=["ts", "Low", "High", "Open", "Close", "Volume"])
-        for c in ["Low", "High", "Open", "Close", "Volume"]:
-            df[c] = df[c].astype(float)
-        df.index = pd.to_datetime(df["ts"], unit="s", utc=True)
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return df if len(df) >= min_bars else None
-    except Exception:
-        return None
-
-def sanitize_and_drop_unclosed(df: Any, interval: str, bar_sec: int,
-                               min_bars: int, instrument: str,
-                               check_stale: bool = True) -> Optional[Any]:
-    if df is None or df.empty:
-        return None
-    now_ts = pd.Timestamp.now(tz="UTC")
-    last_open = df.index[-1]
-    if (now_ts - last_open).total_seconds() < bar_sec:
-        df = df.iloc[:-1].copy()
-    if len(df) < min_bars:
-        return None
-    if check_stale:
-        last_close = df.index[-1] + pd.Timedelta(seconds=bar_sec)
-        age_min = (now_ts - last_close).total_seconds() / 60.0
-        limit = GLOBAL["stale_max_min"].get(interval, 150)
-        if not market_open(instrument, for_monitoring=True):
-            limit = max(limit, GLOBAL["closed_stale_extra_min"])
-        if age_min > limit:
-            logging.info(f"[sanitize] {instrument} {interval} stale closed age={age_min:.0f}m > {limit}m")
-            return None
-    return df
-
-def resample_ohlcv(df: Any, rule_sec: int) -> Optional[Any]:
-    if df is None or df.empty:
-        return None
-    freq = "4h" if rule_sec == 14400 else f"{rule_sec}s"
-    agg = df.resample(freq, origin="epoch").agg({
-        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum",
-    }).dropna(subset=["Open", "High", "Low", "Close"])
-    return agg if not agg.empty else None
-
-def _fetch_from_src(src: Dict[str, Any], instrument: str, mode: str, history: bool
-                    ) -> Tuple[Optional[Any], Optional[Any]]:
-    tf = TIMEFRAMES[mode]
-    df_htf = df_ent = None
-    check_stale = not history
-
-    if mode == "SWING":
-        min_ent = 500 if history else tf["min_bars_entry"]
-        if src["type"] == "twelvedata":
-            df_ent = fetch_twelvedata(src["symbol"], "1h", 1800 if history else 400, min_ent)
-        elif src["type"] == "yfinance":
-            p_ent = "730d" if history else tf["period_entry"]
-            df_ent = fetch_yf(src["symbol"], "1h", p_ent, min_ent)
-        elif src["type"] == "coinbase":
-            b_ent = 20 if history else 4
-            df_ent = fetch_coinbase(src["symbol"], 3600, min_ent, max_batches=b_ent)
-        df_ent = sanitize_and_drop_unclosed(df_ent, tf["entry"], tf["entry_sec"], min_ent, instrument, check_stale)
-        if df_ent is not None:
-            df_htf = resample_ohlcv(df_ent, tf["htf_sec"])
-            df_htf = sanitize_and_drop_unclosed(df_htf, tf["htf"], tf["htf_sec"], tf["min_bars_htf"], instrument, check_stale)
-    else:
-        min_ent = 450 if history else tf["min_bars_entry"]
-        min_htf = 220 if history else tf["min_bars_htf"]
-        if src["type"] == "twelvedata":
-            df_htf = fetch_twelvedata(src["symbol"], tf["htf"], 800 if history else 300, min_htf)
-            df_ent = fetch_twelvedata(src["symbol"], tf["entry"], 2000 if history else 350, min_ent)
-        elif src["type"] == "yfinance":
-            p_htf = "730d" if history else tf["period_htf"]
-            p_ent = "59d"  if history else tf["period_entry"]
-            df_htf = fetch_yf(src["symbol"], tf["htf"], p_htf, min_htf)
-            df_ent = fetch_yf(src["symbol"], tf["entry"], p_ent, min_ent)
-        elif src["type"] == "coinbase":
-            g_htf = COINBASE_GRAN.get(tf["htf"])
-            g_ent = COINBASE_GRAN.get(tf["entry"])
-            if g_htf and g_ent:
-                df_htf = fetch_coinbase(src["symbol"], g_htf, min_htf, max_batches=8 if history else 2)
-                df_ent = fetch_coinbase(src["symbol"], g_ent, min_ent, max_batches=20 if history else 2)
-        df_htf = sanitize_and_drop_unclosed(df_htf, tf["htf"], tf["htf_sec"], min_htf, instrument, check_stale)
-        df_ent = sanitize_and_drop_unclosed(df_ent, tf["entry"], tf["entry_sec"], min_ent, instrument, check_stale)
-
-    if df_htf is not None and df_ent is not None:
-        mul, off = src.get("multiplier", 1.0), src.get("offset", 0.0)
-        if mul != 1.0 or off != 0.0:
-            for df_x in (df_htf, df_ent):
-                for col in ["Open", "High", "Low", "Close"]:
-                    df_x[col] = df_x[col] * mul + off
-        return df_htf, df_ent
-    return None, None
-
-def fetch_pair_locked(instrument: str, mode: str, history: bool = False,
-                      preferred_source: Optional[str] = None
-                      ) -> Tuple[Optional[Any], Optional[Any], Optional[str]]:
-    groups = list(INSTRUMENTS[instrument]["source_groups"])
-    if preferred_source:
-        pref_name = preferred_source.split(":")[0]
-        matched = [g for g in groups if g["name"] == pref_name]
-        if matched:
-            groups = matched
-    for src in groups:
-        df_htf, df_ent = _fetch_from_src(src, instrument, mode, history)
-        if df_htf is not None and df_ent is not None:
-            return df_htf, df_ent, f"{src['name']}:{src['symbol']}"
-    return None, None, None
-
-# ==============================================================================
-# WILDER INDICATORS + VWAP + SQUEEZE + CAUSAL SWINGS
-# ==============================================================================
-def compute_indicators(df: Any, vwap_win: int = 24) -> Any:
-    df = df.copy()
-    close, high, low = df["Close"], df["High"], df["Low"]
-    vol = df["Volume"].where(df["Volume"] > 0, 1.0)
-
-    df["ema20"]  = close.ewm(span=20,  adjust=False).mean()
-    df["ema50"]  = close.ewm(span=50,  adjust=False).mean()
-    df["ema200"] = close.ewm(span=200, min_periods=80, adjust=False).mean()
-
-    prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    df["atr14"] = tr.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-
-    delta = close.diff()
-    gain  = delta.clip(lower=0).ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-    loss  = (-delta.clip(upper=0)).ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-    df["rsi14"] = 100.0 - (100.0 / (1.0 + gain / (loss + 1e-10)))
-
-    up_move, down_move = high.diff(), -low.diff()
-    plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    rma_tr   = tr.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-    plus_di  = 100.0 * pd.Series(plus_dm,  index=df.index).ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean() / (rma_tr + 1e-10)
-    minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean() / (rma_tr + 1e-10)
-    dx       = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
-    df["plus_di"], df["minus_di"] = plus_di, minus_di
-    df["adx14"] = dx.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-
-    net_move = (close - close.shift(20)).abs()
-    path_sum = close.diff().abs().rolling(20).sum()
-    df["er20"] = (net_move / (path_sum + 1e-10)).fillna(0.0)
-    df["atr_pct_rank"] = df["atr14"].rolling(100, min_periods=30).apply(
-        lambda s: float(np.mean(s <= s[-1])), raw=True
-    ).fillna(0.5)
-
-    med20 = close.shift(1).rolling(20).median()
-    mad20 = close.shift(1).rolling(20).apply(lambda s: float(np.median(np.abs(s - np.median(s)))), raw=True)
-    df["mad_zscore20"] = (close - med20) / (mad20 * 1.4826 + 1e-9)
-    df["slope20"]      = df["ema20"].diff(5) / 5.0
-
-    vol_med = df["Volume"].shift(1).rolling(20, min_periods=10).median()
-    df["vol_ratio"] = np.where(vol_med > 0, df["Volume"] / (vol_med + 1e-9), 1.0)
-
-    # v4.0 Rolling VWAP + Z-score
-    tp = (high + low + close) / 3.0
-    pv_sum = (tp * vol).rolling(vwap_win, min_periods=1).sum()
-    v_sum  = vol.rolling(vwap_win, min_periods=1).sum()
-    vwap   = pv_sum / (v_sum + 1e-9)
-    vwap_var = ((tp - vwap) ** 2 * vol).rolling(vwap_win, min_periods=1).sum() / (v_sum + 1e-9)
-    vwap_std = np.sqrt(vwap_var.clip(lower=0.0))
-    df["vwap"]   = vwap
-    df["vwap_z"] = np.where(vwap_std > 1e-9, (close - vwap) / vwap_std, 0.0)
-
-    # v4.0 Bollinger / Keltner Squeeze Ratio
-    bb_std = close.rolling(20, min_periods=20).std(ddof=0)
-    bb_w   = 4.0 * bb_std
-    kc_w   = 3.0 * df["atr14"]
-    df["squeeze_ratio"] = np.where(kc_w > 1e-9, bb_w / kc_w, 1.0)
-    df["squeeze_ratio"] = df["squeeze_ratio"].fillna(1.0)
-    return df
-
-def extract_arrays(df: Any) -> Dict[str, Any]:
-    cols = (
-        "Open", "High", "Low", "Close", "Volume",
-        "ema20", "ema50", "ema200", "atr14", "rsi14",
-        "plus_di", "minus_di", "adx14", "er20",
-        "atr_pct_rank", "mad_zscore20", "slope20", "vol_ratio",
-        "vwap", "vwap_z", "squeeze_ratio",
-    )
-    return {c: df[c].to_numpy(dtype=float) for c in cols}
-
-def extract_causal_swings(df: Any, lookback: int = 5) -> Tuple[Any, Any]:
-    n = len(df)
-    highs, lows = df["High"].to_numpy(dtype=float), df["Low"].to_numpy(dtype=float)
-    last_sh, last_sl = np.full(n, np.nan), np.full(n, np.nan)
-    cur_h = cur_l = np.nan
-    for i in range(n):
-        k = i - lookback
-        if k >= lookback:
-            if highs[k] == np.max(highs[k - lookback : k + lookback + 1]):
-                cur_h = highs[k]
-            if lows[k] == np.min(lows[k - lookback : k + lookback + 1]):
-                cur_l = lows[k]
-        last_sh[i], last_sl[i] = cur_h, cur_l
-    return last_sh, last_sl
-
-def align_htf_idx(htf_close_ts: Any, ent_close_ts: float) -> int:
-    """Strictly align Entry bar close to latest COMPLETED HTF bar (zero lookahead)."""
-    idx = int(np.searchsorted(htf_close_ts, ent_close_ts, side="right")) - 1
-    return idx
-
-def detect_regime_vals(adx: float, er: float, atr: float, rk: float, e20: float, e50: float) -> str:
-    if not (math.isfinite(atr) and atr > 0):
-        return "UNKNOWN"
-    if rk < 0.12 and er < 0.24 and adx < 19.0:
-        return "CHOPPY"
-    ema_sep_atr = abs(e20 - e50) / max(atr, 1e-9)
-    if (
-        (adx >= 21.0 and er >= 0.22)
-        or (adx >= 26.0 and er >= 0.15 and ema_sep_atr >= 0.35)
-        or (er >= 0.35 and ema_sep_atr >= 0.45)
-    ):
-        return "TREND"
-    if adx < 18.0 and er < 0.22:
-        return "CHOPPY"
-    return "RANGE"
-
-def spike_ok_arr(closes: Any, idx: int) -> bool:
-    if idx < 25:
         return True
-    win = closes[idx - 24 : idx + 1]
-    rets = np.diff(win) / np.maximum(win[:-1], 1e-9)
-    base, cur = rets[:-1], float(rets[-1])
-    med = float(np.median(base))
-    mad = float(np.median(np.abs(base - med)))
-    return abs(cur - med) / max(mad * 1.4826, 1e-6) < GLOBAL["spike_mad_threshold"]
-
-# ==============================================================================
-# v4.0 HARDENED SIGNAL ENGINE (SINGLE SOURCE OF TRUTH FOR LIVE & BACKTEST)
-# ==============================================================================
-def _fresh_bos_bars_ago_v4(htf_a: Dict[str, Any], htf_sh: Any, htf_sl: Any,
-                           htf_idx: int, direction: str) -> Optional[int]:
-    def is_broken_at(idx: int, d: str) -> bool:
-        sw = htf_sh[idx] if d == "BUY" else htf_sl[idx]
-        if not math.isfinite(sw):
-            return False
-        c, o = float(htf_a["Close"][idx]), float(htf_a["Open"][idx])
-        rng = max(float(htf_a["High"][idx]) - float(htf_a["Low"][idx]), 1e-9)
-        if abs(c - o) / rng < 0.25:
-            return False
-        return (c > sw * (1.0 + 1e-5) and c > o) if d == "BUY" else (c < sw * (1.0 - 1e-5) and c < o)
-
-    opp_dir = "SELL" if direction == "BUY" else "BUY"
-    max_look = min(int(GLOBAL["bos_fresh_max_bars"]), htf_idx - 1)
-    for b in range(0, max_look + 1):
-        k = htf_idx - b
-        if is_broken_at(k, opp_dir):
-            return None
-        if is_broken_at(k, direction):
-            prev_sw = htf_sh[k - 1] if direction == "BUY" else htf_sl[k - 1]
-            if not math.isfinite(prev_sw) or not is_broken_at(k - 1, direction):
-                return b
-    return None
-
-def evaluate_bar_pair_arrays(
-    htf_a: Dict[str, Any], htf_sh: Any, htf_sl: Any, htf_idx: int,
-    ent_a: Dict[str, Any], ent_idx: int, threshold: int,
-    instrument: Optional[str] = None,
-    live_spread_pts: Optional[float] = None,
-) -> Tuple[Optional[Tuple[str, int, str, str, Dict[str, float]]], str]:
-    don_n = int(GLOBAL["donchian_bars"])
-    if htf_idx < 80 or ent_idx < max(60, don_n + 1):
-        return None, "warmup<80"
-    if not (spike_ok_arr(htf_a["Close"], htf_idx) and spike_ok_arr(ent_a["Close"], ent_idx)):
-        return None, "spike_guard"
-    if not (math.isfinite(htf_sh[htf_idx]) and math.isfinite(htf_sl[htf_idx])):
-        return None, "awaiting_swing"
-
-    atr   = float(ent_a["atr14"][ent_idx])
-    he200 = float(htf_a["ema200"][htf_idx])
-    ec    = float(ent_a["Close"][ent_idx])
-    if not math.isfinite(atr) or atr <= 0 or not math.isfinite(he200):
-        return None, "invalid_atr_or_ema200"
-
-    if instrument is not None:
-        base_sp = float(GLOBAL["spread_pts"].get(instrument, 0.0))
-        sp = float(live_spread_pts) if live_spread_pts is not None else base_sp
-        if base_sp > 0 and sp > float(GLOBAL["max_spread_mult"]) * base_sp:
-            return None, f"spread_spike ({sp:.2f}>{GLOBAL['max_spread_mult']*base_sp:.2f})"
-        fee_bps = float(GLOBAL["taker_fee_bps"].get(instrument, 0.0))
-        fee_pts = ec * fee_bps / 10000.0
-        rt_cost = sp + 2.0 * float(GLOBAL["slippage_pts"].get(instrument, 0.0)) + 2.0 * fee_pts
-        if rt_cost > 0 and atr < float(GLOBAL["min_atr_cost_mult"]) * rt_cost:
-            return None, f"low_atr_vs_cost ({atr:.2f}<{GLOBAL['min_atr_cost_mult']*rt_cost:.2f})"
-
-    adx     = float(htf_a["adx14"][htf_idx])
-    er      = float(htf_a["er20"][htf_idx])
-    htf_atr = float(htf_a["atr14"][htf_idx])
-    htf_rk  = float(htf_a["atr_pct_rank"][htf_idx])
-    he20    = float(htf_a["ema20"][htf_idx])
-    he50    = float(htf_a["ema50"][htf_idx])
-    hc      = float(htf_a["Close"][htf_idx])
-
-    regime = detect_regime_vals(adx, er, htf_atr, htf_rk, he20, he50)
-    if regime in ("CHOPPY", "UNKNOWN"):
-        return None, f"regime={regime} (skip chop)"
-
-    htf_trend = 1 if he20 > he50 else -1
-    eo = float(ent_a["Open"][ent_idx])
-    eh = float(ent_a["High"][ent_idx])
-    el = float(ent_a["Low"][ent_idx])
-    prev_c = float(ent_a["Close"][ent_idx - 1])
-
-    c_rng = max(eh - el, 1e-9)
-    if c_rng > float(GLOBAL["max_candle_atr"]) * atr:
-        return None, f"climax_candle ({c_rng/atr:.1f}xATR)"
-    close_pos  = (ec - el) / c_rng
-    body_ratio = abs(ec - eo) / c_rng
-    up_wick_r  = (eh - max(ec, eo)) / c_rng
-    lo_wick_r  = (min(ec, eo) - el) / c_rng
-
-    ee20  = float(ent_a["ema20"][ent_idx])
-    ee50  = float(ent_a["ema50"][ent_idx])
-    slope = float(ent_a["slope20"][ent_idx])
-    rsi   = float(ent_a["rsi14"][ent_idx])
-    mad_z = float(ent_a["mad_zscore20"][ent_idx]) if math.isfinite(ent_a["mad_zscore20"][ent_idx]) else 0.0
-    vwap  = float(ent_a["vwap"][ent_idx]) if math.isfinite(ent_a["vwap"][ent_idx]) else ec
-    vwap_z = float(ent_a["vwap_z"][ent_idx]) if math.isfinite(ent_a["vwap_z"][ent_idx]) else 0.0
-    sq_ratio = float(ent_a["squeeze_ratio"][ent_idx])
-    pdi   = float(htf_a["plus_di"][htf_idx])
-    mdi   = float(htf_a["minus_di"][htf_idx])
-    ent_atr_rk = float(ent_a["atr_pct_rank"][ent_idx])
-    dist_e20_atr = abs(ec - ee20) / max(atr, 1e-9)
-    vol_ratio = float(ent_a["vol_ratio"][ent_idx])
-    has_vol = float(ent_a["Volume"][ent_idx]) > 1.5
-
-    hi20 = float(np.max(ent_a["High"][ent_idx - don_n : ent_idx]))
-    lo20 = float(np.min(ent_a["Low"][ent_idx - don_n : ent_idx]))
-    vol_ok = (not has_vol) or (vol_ratio >= 1.10)
-    brk_qual_ok = (regime == "TREND") or (adx >= 20.5 and ent_atr_rk >= 0.35 and sq_ratio >= 0.90 and vol_ok)
-
-    max_wick = float(GLOBAL["max_wick_ratio"])
-    bull_brk = (
-        brk_qual_ok and (ec > hi20) and (prev_c <= hi20)
-        and (close_pos >= 0.60) and (body_ratio >= 0.38)
-        and (up_wick_r <= max_wick)
-        and (dist_e20_atr <= float(GLOBAL["max_dist_ema20_atr"]))
-    )
-    bear_brk = (
-        brk_qual_ok and (ec < lo20) and (prev_c >= lo20)
-        and (close_pos <= 0.40) and (body_ratio >= 0.38)
-        and (lo_wick_r <= max_wick)
-        and (dist_e20_atr <= float(GLOBAL["max_dist_ema20_atr"]))
-    )
-
-    bull_pb = (
-        regime == "TREND" and htf_trend == 1 and hc > he50 and he50 > he200 and pdi > mdi
-        and ee20 > ee50 and slope > 0 and el <= ee20 + 0.25 * atr
-        and ec > ee20 and ec > eo and close_pos >= 0.62 and body_ratio >= 0.40
-        and (up_wick_r <= max_wick) and 42.0 <= rsi <= 65.0
-    )
-    bear_pb = (
-        regime == "TREND" and htf_trend == -1 and hc < he50 and he50 < he200 and mdi > pdi
-        and ee20 < ee50 and slope < 0 and eh >= ee20 - 0.25 * atr
-        and ec < ee20 and ec < eo and close_pos <= 0.38 and body_ratio >= 0.40
-        and (lo_wick_r <= max_wick) and 35.0 <= rsi <= 58.0
-    )
-
-    bos_buy  = _fresh_bos_bars_ago_v4(htf_a, htf_sh, htf_sl, htf_idx, "BUY")
-    bos_sell = _fresh_bos_bars_ago_v4(htf_a, htf_sh, htf_sl, htf_idx, "SELL")
-
-    sb = ss = 0
-    if htf_trend == 1 and hc > he50: sb += 18
-    elif htf_trend == 1:            sb += 8
-    if htf_trend == -1 and hc < he50: ss += 18
-    elif htf_trend == -1:             ss += 8
-
-    if hc > he200 and he50 > he200: sb += 18
-    elif hc > he200:               sb += 10
-    if hc < he200 and he50 < he200: ss += 18
-    elif hc < he200:               ss += 10
-
-    if bull_brk or bull_pb: sb += 24
-    if bear_brk or bear_pb: ss += 24
-
-    if bos_buy is not None:  sb += 10 if bos_buy <= 6 else 6
-    if bos_sell is not None: ss += 10 if bos_sell <= 6 else 6
-
-    if pdi > mdi: sb += 12 if regime == "TREND" else 6
-    if mdi > pdi: ss += 12 if regime == "TREND" else 6
-
-    if ec > ee20 and slope > 0: sb += 8
-    if ec < ee20 and slope < 0: ss += 8
-
-    if ec >= vwap and vwap_z <= 1.8:  sb += 5
-    if ec <= vwap and vwap_z >= -1.8: ss += 5
-
-    if (bull_brk or bull_pb) and has_vol and vol_ratio >= 1.25: sb += 5
-    if (bear_brk or bear_pb) and has_vol and vol_ratio >= 1.25: ss += 5
-
-    diag = f"regime={regime} adx={adx:.1f} er={er:.2f} rsi={rsi:.1f} vwap_z={vwap_z:+.1f} sb={sb} ss={ss}"
-
-    if htf_trend == 1 and sb >= threshold and sb >= ss + 10:
-        direction, score = "BUY", sb
-    elif htf_trend == -1 and ss >= threshold and ss >= sb + 10:
-        direction, score = "SELL", ss
-    else:
-        return None, f"{diag} (score<{threshold})"
-
-    setup_name: Optional[str] = None
-    if direction == "BUY":
-        setup_name = "BREAKOUT" if bull_brk else ("PULLBACK" if bull_pb else None)
-    else:
-        setup_name = "BREAKOUT" if bear_brk else ("PULLBACK" if bear_pb else None)
-
-    if setup_name is None:
-        return None, f"{diag} (no breakout/pullback)"
-    if (direction == "BUY" and (hc <= he200 or hc <= he50)) or (direction == "SELL" and (hc >= he200 or hc >= he50)):
-        return None, f"{diag} (counter-HTF EMA50/200)"
-    if direction == "BUY" and (rsi > GLOBAL["rsi_max_buy"] or mad_z > GLOBAL["mad_z_max_abs"] or vwap_z > GLOBAL["vwap_z_max_abs"]):
-        return None, f"{diag} (overextended BUY)"
-    if direction == "SELL" and (rsi < GLOBAL["rsi_min_sell"] or mad_z < -GLOBAL["mad_z_max_abs"] or vwap_z < -GLOBAL["vwap_z_max_abs"]):
-        return None, f"{diag} (overextended SELL)"
-
-    # v4.0 Overhead HTF Swing Clearance ("Room-to-Run")
-    if direction == "BUY" and htf_sh[htf_idx] > ec:
-        room = (float(htf_sh[htf_idx]) - ec) / max(atr, 1e-9)
-        if room < float(GLOBAL["min_room_swing_atr"]):
-            return None, f"{diag} (blocked_by_htf_sh {room:.2f}xATR)"
-    if direction == "SELL" and htf_sl[htf_idx] < ec:
-        room = (ec - float(htf_sl[htf_idx])) / max(atr, 1e-9)
-        if room < float(GLOBAL["min_room_swing_atr"]):
-            return None, f"{diag} (blocked_by_htf_sl {room:.2f}xATR)"
-
-    return (direction, int(min(100, score)), regime, setup_name, {
-        "atr": atr, "rsi": rsi, "mad_z": mad_z, "vwap_z": vwap_z, "adx": adx, "er": er, "entry": ec,
-    }), diag
-
-def calc_lot(balance: float, risk_pct: float, sl_dist: float,
-             contract: Dict[str, Any]) -> Tuple[float, float, bool]:
-    risk_amt = balance * (risk_pct / 100.0)
-    if not math.isfinite(sl_dist) or sl_dist <= 0:
-        return float(contract["min_lot"]), round(risk_amt, 2), True
-    raw = risk_amt / (sl_dist * float(contract["pip_value_per_lot"]))
-    step = float(contract["lot_step"])
-    lot = math.floor(raw / step) * step
-    lot = max(float(contract["min_lot"]), min(float(contract["max_lot"]), lot))
-    actual_risk = lot * sl_dist * float(contract["pip_value_per_lot"])
-    warn = raw < float(contract["min_lot"]) and actual_risk > risk_amt * 1.25
-    return round(lot, 2), round(actual_risk, 2), warn
-
-def load_calibrated_params() -> Dict[str, Any]:
-    if os.path.exists(PARAMS_PATH):
-        try:
-            with open(PARAMS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            pass
-    return {}
-
-def evaluate_signal(instrument: str, mode: str,
-                    calibrated: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    cal = (calibrated or {}).get(f"{instrument}:{mode}")
-    if cal is not None and not cal.get("enabled", True):
-        logging.info(f"[eval] {instrument} {mode} | skip: disabled ({cal.get('reason', 'oos_fail')})")
-        return None
-    if rollover_blackout(instrument):
-        logging.info(f"[eval] {instrument} {mode} | skip: daily rollover blackout")
-        return None
-    if mode == "SCALPING" and not scalping_session_ok(instrument):
-        logging.info(f"[eval] {instrument} {mode} | skip: outside scalp session")
-        return None
-
-    micro = fetch_live_microstructure(instrument)
-    if micro["div_bps"] > float(GLOBAL["max_cross_div_bps"]):
-        logging.warning(f"[eval] {instrument} {mode} | skip: cross-exchange divergence {micro['div_bps']:.1f}bps")
-        return None
-
-    df_htf, df_ent, src = fetch_pair_locked(instrument, mode)
-    if df_htf is None or df_ent is None:
-        logging.info(f"[eval] {instrument} {mode} | skip: no fresh/sufficient data")
-        return None
-
-    df_htf = compute_indicators(df_htf)
-    df_ent = compute_indicators(df_ent)
-    htf_a, ent_a = extract_arrays(df_htf), extract_arrays(df_ent)
-    htf_sh, htf_sl = extract_causal_swings(df_htf, lookback=5)
-
-    tf = TIMEFRAMES[mode]
-    cal_d = cal or {}
-    threshold  = int(cal_d.get("threshold", GLOBAL["min_score_signal"]))
-    sl_mult    = float(cal_d.get("sl_mult", tf["sl_atr"]))
-    tp2_mult   = float(cal_d.get("tp_mult", tf["tp_atr"][1]))
-    trail_mult = float(cal_d.get("trail_mult", tf["trail_atr"]))
-    tp3_mult   = max(float(tf["tp_atr"][2]), round(tp2_mult * 1.25, 2))
-
-    htf_close_ts = _to_epoch_sec(df_htf.index) + tf["htf_sec"]
-    ent_close_ts = _to_epoch_sec(df_ent.index) + tf["entry_sec"]
-
-    eval_idx = len(df_ent) - 1
-    htf_idx  = align_htf_idx(htf_close_ts, float(ent_close_ts[eval_idx]))
-    if htf_idx < 80:
-        return None
-
-    res, diag = evaluate_bar_pair_arrays(
-        htf_a, htf_sh, htf_sl, htf_idx, ent_a, eval_idx, threshold,
-        instrument=instrument, live_spread_pts=micro["spread_pts"],
-    )
-
-    if res is None and mode == "SCALPING" and len(df_ent) >= 3:
-        prev_bar_close = df_ent.index[-2] + pd.Timedelta(seconds=tf["entry_sec"])
-        age_sec = (pd.Timestamp.now(tz="UTC") - prev_bar_close).total_seconds()
-        if age_sec <= 1200:
-            prev_htf_idx = align_htf_idx(htf_close_ts, float(ent_close_ts[-2]))
-            if prev_htf_idx >= 80:
-                res2, diag2 = evaluate_bar_pair_arrays(
-                    htf_a, htf_sh, htf_sl, prev_htf_idx, ent_a, len(df_ent) - 2, threshold,
-                    instrument=instrument, live_spread_pts=micro["spread_pts"],
-                )
-                if res2 is not None:
-                    c_now = float(ent_a["Close"][-1])
-                    if abs(c_now - res2[4]["entry"]) <= 0.35 * res2[4]["atr"]:
-                        eval_idx = len(df_ent) - 2
-                        res = (res2[0], res2[1], res2[2], res2[3], {**res2[4], "entry": c_now})
-                        diag = f"{diag2} [jitter-catch -2 aligned]"
-
-    close_px = float(ent_a["Close"][-1])
-    if res is None:
-        logging.info(f"[eval] {instrument} {mode} | src={src} close={close_px:.2f} | {diag}")
-        return None
-
-    direction, score, regime, setup_name, ctx = res
-    logging.info(f"[eval] {instrument} {mode} | src={src} close={close_px:.2f} | SIGNAL {direction} {setup_name} {score}/100 ({diag})")
-    entry, atr = ctx["entry"], ctx["atr"]
-
-    if direction == "BUY":
-        sl  = entry - sl_mult * atr
-        tp1 = entry + tf["tp1_r"] * sl_mult * atr
-        tp2 = entry + tp2_mult * atr
-        tp3 = entry + tp3_mult * atr
-    else:
-        sl  = entry + sl_mult * atr
-        tp1 = entry - tf["tp1_r"] * sl_mult * atr
-        tp2 = entry - tp2_mult * atr
-        tp3 = entry - tp3_mult * atr
-
-    risk_pct = ACCOUNT["risk_pct_scalp"] if mode == "SCALPING" else ACCOUNT["risk_pct_swing"]
-    lot, risk_usd, risk_warn = calc_lot(
-        float(ACCOUNT["balance"]), risk_pct, abs(entry - sl),
-        INSTRUMENTS[instrument]["contract"],
-    )
-
-    return {
-        "instrument": instrument, "mode": mode, "direction": direction, "setup": setup_name,
-        "entry": round(entry, 4), "sl": round(sl, 4),
-        "tp1": round(tp1, 4), "tp2": round(tp2, 4), "tp3": round(tp3, 4),
-        "trail_dist": round(trail_mult * atr, 4),
-        "lot": lot, "risk_usd": risk_usd, "risk_warn": risk_warn,
-        "score": score, "regime": regime, "source": src,
-        "atr": round(atr, 4), "rsi": round(ctx["rsi"], 1),
-        "adx": round(ctx["adx"], 1), "zscore": round(ctx["mad_z"], 2),
-        "ts": now_utc_iso(),
-        "bar_ts": df_ent.index[eval_idx].strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-
-# ==============================================================================
-# ULTRA-FAST BACKTESTER WITH PARTIAL TP1 + COMMISSION + WALK-FORWARD + MC
-# ==============================================================================
-def _to_epoch_sec(idx: Any) -> Any:
-    base = pd.Timestamp("1970-01-01", tz="UTC")
-    utc_idx = idx.tz_localize("UTC") if idx.tzinfo is None else idx.tz_convert("UTC")
-    return ((utc_idx - base) / pd.Timedelta(seconds=1)).to_numpy(dtype=float)
-
-def precompute_signals_for_threshold(
-    htf_a: Dict[str, Any], htf_sh: Any, htf_sl: Any, htf_close_ts: Any,
-    ent_a: Dict[str, Any], ent_close_ts: Any, ent_dts: List[datetime],
-    instrument: str, mode: str, threshold: int,
-) -> List[Optional[Tuple[str, float]]]:
-    n_ent = len(ent_dts)
-    sig_cache: List[Optional[Tuple[str, float]]] = [None] * n_ent
-    for i in range(80, n_ent - 2):
-        htf_idx = align_htf_idx(htf_close_ts, float(ent_close_ts[i]))
-        if htf_idx < 80:
-            continue
-        bar_dt = ent_dts[i + 1]
-        if not market_open(instrument, bar_dt, for_monitoring=False, mode=mode):
-            continue
-        if rollover_blackout(instrument, bar_dt):
-            continue
-        if mode == "SCALPING" and not scalping_session_ok(instrument, bar_dt):
-            continue
-        res, _ = evaluate_bar_pair_arrays(
-            htf_a, htf_sh, htf_sl, htf_idx, ent_a, i, threshold, instrument=instrument
-        )
-        if res is not None:
-            sig_cache[i] = (res[0], float(res[4]["atr"]))
-    return sig_cache
-
-def backtest_mtf_fast(
-    ent_a: Dict[str, Any], ent_open_ts: Any, sig_cache: List[Optional[Tuple[str, float]]],
-    instrument: str, mode: str, sl_mult: float, tp_target_mult: float,
-    min_trades: int, start_idx: int = 80, end_idx: Optional[int] = None,
-) -> Dict[str, Any]:
-    tf = TIMEFRAMES[mode]
-    spread = float(GLOBAL["spread_pts"].get(instrument, 1.0))
-    slip   = float(GLOBAL["slippage_pts"].get(instrument, 0.1))
-    fee_r  = float(GLOBAL["taker_fee_bps"].get(instrument, 0.0)) / 10000.0
-    risk_frac    = float(GLOBAL["bt_risk_pct"])
-    trail_mult   = float(tf["trail_atr"])
-    be_trigger_r = float(tf["be_trigger_r"])
-    tp1_r        = float(tf["tp1_r"])
-    max_hold     = int(tf["max_hold_bars"])
-    cd_same      = float(tf["cooldown_same_min"])
-    cd_flip      = float(tf["cooldown_flip_min"])
-
-    opens, highs, lows, closes = ent_a["Open"], ent_a["High"], ent_a["Low"], ent_a["Close"]
-    equity = peak = 10000.0
-    curve, trades_pnl, trades_r = [equity], [], []
-    last_exit_ts, last_dir = 0.0, None
-    i = max(80, int(start_idx))
-    n_ent = min(len(opens), int(end_idx)) if end_idx is not None else len(opens)
-
-    while i < n_ent - 2:
-        if equity < GLOBAL["bt_min_equity"] or (peak - equity) / max(peak, 1e-9) > GLOBAL["bt_max_dd_stop"]:
-            break
-        sig = sig_cache[i]
-        if sig is None:
-            i += 1
-            continue
-        direction, atr = sig
-        if last_dir is not None:
-            cd_min = cd_same if last_dir == direction else cd_flip
-            if (ent_open_ts[i] - last_exit_ts) / 60.0 < cd_min:
-                i += 1
-                continue
-
-        enter_idx = i + 1
-        next_open = float(opens[enter_idx])
-        sl_dist, trail_dist = sl_mult * atr, trail_mult * atr
-        fill = (next_open + spread / 2.0 + slip) if direction == "BUY" else (next_open - spread / 2.0 - slip)
-        sl_orig = (fill - sl_dist) if direction == "BUY" else (fill + sl_dist)
-        tp1_px  = (fill + tp1_r * sl_dist) if direction == "BUY" else (fill - tp1_r * sl_dist)
-        tp2_tgt = (fill + tp_target_mult * atr) if direction == "BUY" else (fill - tp_target_mult * atr)
-
-        active_sl, tp1_hit, rem_frac, realized_gross, max_fav = sl_orig, False, 1.0, 0.0, fill
-        risk_amt = max(equity * risk_frac, 1e-9)
-        units = risk_amt / max(sl_dist, 1e-9)
-        max_j = min(enter_idx + max_hold, n_ent - 1)
-        exit_px, exit_j = float(closes[max_j]), max_j
-
-        for j in range(enter_idx, max_j + 1):
-            o, h, l = float(opens[j]), float(highs[j]), float(lows[j])
-            if direction == "BUY":
-                bo, bl, bh = o - spread / 2.0, l - spread / 2.0, h - spread / 2.0
-                if bo <= active_sl: exit_px, exit_j = bo - slip, j; break
-                if bl <= active_sl: exit_px, exit_j = active_sl - slip, j; break
-                if not tp1_hit and bh >= tp1_px:
-                    tp1_hit = True
-                    realized_gross += (tp1_px - fill) * (units * 0.5)
-                    rem_frac = 0.5
-                    active_sl = max(active_sl, fill + 0.08 * sl_dist)
-                if bh >= tp2_tgt: exit_px, exit_j = tp2_tgt, j; break
-                if bh > max_fav: max_fav = bh
-                if (max_fav - fill) >= be_trigger_r * sl_dist:
-                    active_sl = max(active_sl, fill + 0.08 * sl_dist, max_fav - trail_dist)
-            else:
-                ao, ah, al = o + spread / 2.0, h + spread / 2.0, l + spread / 2.0
-                if ao >= active_sl: exit_px, exit_j = ao + slip, j; break
-                if ah >= active_sl: exit_px, exit_j = active_sl + slip, j; break
-                if not tp1_hit and al <= tp1_px:
-                    tp1_hit = True
-                    realized_gross += (fill - tp1_px) * (units * 0.5)
-                    rem_frac = 0.5
-                    active_sl = min(active_sl, fill - 0.08 * sl_dist)
-                if al <= tp2_tgt: exit_px, exit_j = tp2_tgt, j; break
-                if al < max_fav: max_fav = al
-                if (fill - max_fav) >= be_trigger_r * sl_dist:
-                    active_sl = min(active_sl, fill - 0.08 * sl_dist, max_fav + trail_dist)
-            if j == max_j:
-                c = float(closes[j])
-                exit_px = (c - spread / 2.0 - slip) if direction == "BUY" else (c + spread / 2.0 + slip)
-
-        tail_gross = ((exit_px - fill) if direction == "BUY" else (fill - exit_px)) * (units * rem_frac)
-        fee_cost = (fill + exit_px) * units * fee_r
-        pnl = realized_gross + tail_gross - fee_cost
-        equity += pnl
-        peak = max(peak, equity)
-        curve.append(equity)
-        trades_pnl.append(pnl)
-        trades_r.append(pnl / risk_amt)
-        last_exit_ts = float(ent_open_ts[exit_j])
-        last_dir = direction
-        i = exit_j + 1
-
-    n_tr = len(trades_pnl)
-    wins = sum(1 for p in trades_pnl if p > 0)
-    wr   = (wins / n_tr) if n_tr else 0.0
-    gw   = sum(p for p in trades_pnl if p > 0)
-    gl   = abs(sum(p for p in trades_pnl if p < 0))
-    pf   = (gw / (gl + 1e-8)) if n_tr else 0.0
-
-    if n_tr < min_trades:
-        return {"score": -1e9, "trades": n_tr, "winrate": wr, "profit_factor": pf,
-                "max_dd": 0.0, "sqn": 0.0, "equity_curve": curve, "trades_r": trades_r}
-    pk, mdd = curve[0], 0.0
-    for v in curve:
-        pk = max(pk, v)
-        mdd = max(mdd, (pk - v) / max(pk, 1e-9))
-    exp_r = float(sum(trades_r) / n_tr)
-    std_r = float(np.std(trades_r, ddof=1)) if n_tr > 1 else 1.0
-    sqn   = (math.sqrt(n_tr) * exp_r / std_r) if std_r > 1e-9 else 0.0
-    score = exp_r * wr * math.log1p(pf) * (1.0 - mdd) * min(1.0, math.sqrt(n_tr / 40.0))
-    return {"score": score, "trades": n_tr, "winrate": wr, "profit_factor": pf,
-            "max_dd": mdd, "sqn": sqn, "equity_curve": curve, "trades_r": trades_r}
-
-def monte_carlo_prob_profit(trades_r: List[float], runs: int = 500, risk_frac: float = 0.005) -> float:
-    n = len(trades_r)
-    if n < 5:
-        return 0.0
-    rng = random.Random(20261125)
-    profitable = 0
-    for _ in range(runs):
-        eq = 10000.0
-        for _ in range(n):
-            eq += eq * risk_frac * rng.choice(trades_r)
-        if eq > 10000.0:
-            profitable += 1
-    return profitable / float(runs)
-
-# ==============================================================================
-# SQLITE SCHEMA & STATE LAYER
-# ==============================================================================
-CANONICAL_DDL = {
-    "signals": """
-        CREATE TABLE {tbl} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, bar_ts TEXT,
-            instrument TEXT NOT NULL, mode TEXT NOT NULL, direction TEXT NOT NULL,
-            entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL, lot REAL,
-            risk_usd REAL, score INTEGER, setup TEXT, regime TEXT, source TEXT,
-            message TEXT, notified INTEGER DEFAULT 0
-        )
-    """,
-    "open_trades": """
-        CREATE TABLE {tbl} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, opened_ts TEXT NOT NULL,
-            instrument TEXT NOT NULL, mode TEXT NOT NULL, direction TEXT NOT NULL,
-            entry REAL NOT NULL, initial_sl REAL NOT NULL, sl REAL NOT NULL,
-            tp1 REAL NOT NULL, tp2 REAL NOT NULL, tp3 REAL NOT NULL,
-            lot REAL NOT NULL, risk_usd REAL DEFAULT 0, be_active INTEGER DEFAULT 0,
-            tp1_hit INTEGER DEFAULT 0, status TEXT DEFAULT 'OPEN', closed_ts TEXT,
-            exit_price REAL, r_result REAL, trail_dist REAL DEFAULT 0,
-            last_bar_ts TEXT, bars_held INTEGER DEFAULT 0, source TEXT
-        )
-    """,
-    "cooldown": """
-        CREATE TABLE {tbl} (
-            instrument TEXT NOT NULL, mode TEXT NOT NULL, direction TEXT NOT NULL,
-            last_ts TEXT NOT NULL, last_bar_ts TEXT, PRIMARY KEY (instrument, mode)
-        )
-    """,
-    "state": "CREATE TABLE {tbl} (key TEXT PRIMARY KEY, value TEXT)",
-}
-
-def db_init(conn: sqlite3.Connection) -> None:
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    for tbl, ddl in CANONICAL_DDL.items():
-        conn.execute(ddl.format(tbl=f"IF NOT EXISTS {tbl}"))
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(open_trades)").fetchall()}
-    if "tp1_hit" not in cols:
-        conn.execute("ALTER TABLE open_trades ADD COLUMN tp1_hit INTEGER DEFAULT 0")
-    conn.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_signals_inst_id ON signals(instrument, id DESC);
-        CREATE INDEX IF NOT EXISTS idx_signals_bar ON signals(instrument, mode, bar_ts);
-        CREATE INDEX IF NOT EXISTS idx_open_trades_status ON open_trades(status, instrument, mode);
-    """)
-    conn.commit()
-
-# ==============================================================================
-# NOTIFICATIONS & LIVE MONITOR (WITH PARTIAL TP1 PARITY)
-# ==============================================================================
-def _esc(val: Any) -> str:
-    return html.escape(str(val), quote=False)
-
-def send_telegram(text: str, chat_id: Optional[str] = None, retries: int = 4) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not (chat_id or TELEGRAM_CHAT_ID):
+    except Exception as exc:
+        log.error("Telegram send error: %s", exc)
         return False
-    url, delay = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 1.0
-    cid = chat_id or TELEGRAM_CHAT_ID
-    for _ in range(retries):
-        try:
-            r = requests.post(url, json={"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=20)
-            if r.ok:
-                return True
-            if r.status_code == 429:
-                time.sleep(float(r.json().get("parameters", {}).get("retry_after", delay)))
-                continue
-        except Exception:
-            pass
-        time.sleep(delay)
-        delay = min(delay * 2, 20.0)
-    return False
 
-def send_discord(text: str) -> bool:
+
+def tg_send_photo(photo_path: str, caption: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not os.path.exists(photo_path):
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        with open(photo_path, "rb") as f:
+            resp = _HTTP.post(
+                url,
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1020], "parse_mode": "HTML"},
+                files={"photo": f},
+                timeout=20,
+            )
+            resp.raise_for_status()
+        return True
+    except Exception as exc:
+        log.error("Telegram sendPhoto error: %s", exc)
+        return False
+
+
+def dc_send(html_text: str) -> bool:
     if not DISCORD_WEBHOOK_URL:
         return False
-    plain = text.replace("<b>", "**").replace("</b>", "**").replace("<code>", "`").replace("</code>", "`")
+    md = html_text.replace("<b>", "**").replace("</b>", "**").replace("<code>", "`").replace("</code>", "`")
+    md = re.sub(r"<[^>]+>", "", md)
+    md = html.unescape(md)
     try:
-        return requests.post(DISCORD_WEBHOOK_URL, json={"content": plain}, timeout=20).ok
-    except Exception:
+        request_with_backoff("POST", DISCORD_WEBHOOK_URL, json={"content": md[:1980]})
+        return True
+    except Exception as exc:
+        log.error("Discord webhook error: %s", exc)
         return False
 
-def _notify_all(msg: str) -> Tuple[bool, bool]:
-    return send_telegram(msg), send_discord(msg)
 
-def format_signal_message(sig: Dict[str, Any]) -> str:
-    badge = "🟢" if sig["direction"] == "BUY" else "🔴"
-    warn_txt = " ⚠️" if sig["risk_warn"] else ""
+def notify_all(html_text: str) -> bool:
+    sent_tg = tg_send(html_text)
+    sent_dc = dc_send(html_text)
+    return sent_tg or sent_dc
+
+
+# ==============================================================================
+# 3. DATABASE & STATE PERSISTENCE (SQLITE WAL)
+# ==============================================================================
+def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=20.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS state (
+            key TEXT PRIMARY KEY,
+            val TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inst TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            candle_ts TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            entry REAL NOT NULL,
+            sl REAL NOT NULL,
+            orig_sl REAL NOT NULL,
+            tp1 REAL NOT NULL,
+            tp2 REAL NOT NULL,
+            tp3 REAL NOT NULL,
+            lot REAL NOT NULL,
+            risk_usd REAL NOT NULL,
+            tp1_hit INTEGER NOT NULL DEFAULT 0,
+            trail_atr REAL NOT NULL DEFAULT 0,
+            best_sl REAL NOT NULL,
+            bars_held INTEGER NOT NULL DEFAULT 0,
+            exit_price REAL,
+            exit_reason TEXT,
+            pnl_r REAL,
+            pnl_usd REAL,
+            score INTEGER,
+            regime TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS calibration_state (
+            inst TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            params_json TEXT NOT NULL,
+            oos_pf REAL NOT NULL,
+            oos_winrate REAL NOT NULL,
+            oos_dd REAL NOT NULL,
+            oos_trades INTEGER NOT NULL,
+            oos_folds_passed INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (inst, mode)
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            inst TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status, opened_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_trades_inst_mode ON trades (inst, mode, opened_at DESC);
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def get_state(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:
+    row = conn.execute("SELECT val FROM state WHERE key = ?", (key,)).fetchone()
+    return row["val"] if row else default
+
+
+def set_state(conn: sqlite3.Connection, key: str, val: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO state (key, val, updated_at) VALUES (?, ?, ?)",
+        (key, str(val), utc_iso()),
+    )
+    conn.commit()
+
+
+def audit_log(
+    conn: Optional[sqlite3.Connection],
+    event_type: str,
+    inst: str,
+    mode: str,
+    decision: str,
+    details: Dict[str, Any],
+) -> None:
+    payload = json.dumps(details, ensure_ascii=False, default=str)
+    log.info("AUDIT | %s | %s | %s | %s | %s", event_type, inst, mode, decision, payload[:300])
+    if conn is not None:
+        try:
+            conn.execute(
+                "INSERT INTO audit_logs (logged_at, event_type, inst, mode, decision, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (utc_iso(), event_type, inst, mode, decision, payload),
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            log.warning("Audit DB write warning: %s", exc)
+
+
+def notify_error_throttled(conn: sqlite3.Connection, context_msg: str, err: Exception) -> None:
+    last_iso = get_state(conn, "last_error_alert_utc")
+    if last_iso:
+        try:
+            last_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+            if (utc_now() - last_dt).total_seconds() < GLOBAL["error_cooldown_min"] * 60:
+                return
+        except ValueError:
+            pass
+    msg = (
+        f"🚨 <b>QUANT BOT v{BOT_VERSION} ERROR</b>\n"
+        f"🕒 <code>{utc_iso()}</code>\n"
+        f"📍 Konteks: <code>{html.escape(context_msg)}</code>\n"
+        f"⚠️ Detail: <code>{html.escape(f'{type(err).__name__}: {err}')[:450]}</code>"
+    )
+    if notify_all(msg):
+        set_state(conn, "last_error_alert_utc", utc_iso())
+
+
+# ==============================================================================
+# 4. PURE STDLIB RFC6455 TLS WEBSOCKET + DERIV WS BATCH CLIENT
+# ==============================================================================
+class _RawTLSWebSocket:
+    _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, url: str, timeout: float, origin: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme != "wss" or not parsed.hostname:
+            raise ValueError(f"Invalid WSS URL: {url}")
+        host = parsed.hostname
+        port = parsed.port or 443
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        raw = socket.create_connection((host, port), timeout=timeout)
+        ctx = ssl.create_default_context()
+        self._sock = ctx.wrap_socket(raw, server_hostname=host)
+        self._sock.settimeout(timeout)
+
+        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Origin: {origin}\r\n"
+            f"User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36\r\n\r\n"
+        )
+        self._sock.sendall(req.encode("utf-8"))
+
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("WS handshake closed prematurely")
+            buf.extend(chunk)
+            if len(buf) > 32768:
+                raise ConnectionError("WS handshake too large")
+
+        hdr_end = buf.index(b"\r\n\r\n") + 4
+        hdr_text = bytes(buf[:hdr_end]).decode("utf-8", errors="replace")
+        self._leftover = bytearray(buf[hdr_end:])
+        lines = hdr_text.split("\r\n")
+        if " 101 " not in (lines[0] if lines else ""):
+            raise ConnectionError(f"WS handshake rejected: {lines[0] if lines else ''}")
+
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        expected = base64.b64encode(hashlib.sha1((ws_key + self._WS_GUID).encode("ascii")).digest()).decode("ascii")
+        if headers.get("sec-websocket-accept", "") != expected:
+            raise ConnectionError("Invalid Sec-WebSocket-Accept")
+
+    def _read_exact(self, n: int) -> bytes:
+        out = bytearray()
+        if self._leftover:
+            take = min(n, len(self._leftover))
+            out.extend(self._leftover[:take])
+            del self._leftover[:take]
+        while len(out) < n:
+            c = self._sock.recv(n - len(out))
+            if not c:
+                raise EOFError("WS socket closed")
+            out.extend(c)
+        return bytes(out)
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        mask = os.urandom(4)
+        hdr = bytearray([0x80 | opcode])
+        n = len(payload)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.extend([0x80 | 126])
+            hdr.extend(struct.pack("!H", n))
+        else:
+            hdr.extend([0x80 | 127])
+            hdr.extend(struct.pack("!Q", n))
+        hdr.extend(mask)
+        masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        self._sock.sendall(bytes(hdr) + masked)
+
+    def send(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
+
+    def recv(self) -> str:
+        frags: List[bytes] = []
+        while True:
+            b1, b2 = self._read_exact(2)
+            fin = bool(b1 & 0x80)
+            op = b1 & 0x0F
+            masked = bool(b2 & 0x80)
+            ln = b2 & 0x7F
+            if ln == 126:
+                ln = struct.unpack("!H", self._read_exact(2))[0]
+            elif ln == 127:
+                ln = struct.unpack("!Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else b""
+            pl = self._read_exact(ln)
+            if masked:
+                pl = bytes(b ^ mask[i & 3] for i, b in enumerate(pl))
+            if op == 0x8:
+                raise EOFError("WS CLOSE")
+            if op == 0x9:
+                self._send_frame(0xA, pl)
+                continue
+            if op == 0xA:
+                continue
+            if op in (0x0, 0x1, 0x2):
+                frags.append(pl)
+                if fin:
+                    return b"".join(frags).decode("utf-8", errors="replace")
+
+    def close(self) -> None:
+        try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+def _ws_candidate_urls() -> List[str]:
+    urls = [DERIV_PUBLIC_WS_URL]
+    for base in DERIV_LEGACY_WS_URLS:
+        urls.append(f"{base}?app_id=16929")
+    return urls
+
+
+def _ws_fetch_candles(deriv_sym: str, gran: int, batches: int = 2, count: int = 1800) -> Optional[pd.DataFrame]:
+    hdr = {
+        "Origin": DERIV_ORIGIN,
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+    }
+    for ws_url in _ws_candidate_urls():
+        for transport in ("websocket_client", "websockets_sync", "raw_stdlib"):
+            ws = None
+            try:
+                if transport == "websocket_client":
+                    if websocket is None:
+                        continue
+                    ws = websocket.create_connection(
+                        ws_url,
+                        timeout=HTTP_TIMEOUT_SEC,
+                        origin=DERIV_ORIGIN,
+                        header=[f"{k}: {v}" for k, v in hdr.items() if k != "Origin"],
+                    )
+                elif transport == "websockets_sync":
+                    if ws_sync_connect is None:
+                        continue
+                    ws = ws_sync_connect(
+                        ws_url,
+                        open_timeout=HTTP_TIMEOUT_SEC,
+                        close_timeout=4,
+                        origin=DERIV_ORIGIN,
+                        additional_headers={k: v for k, v in hdr.items() if k != "Origin"},
+                    )
+                else:
+                    ws = _RawTLSWebSocket(ws_url, timeout=HTTP_TIMEOUT_SEC, origin=DERIV_ORIGIN)
+
+                all_candles: List[Dict[str, Any]] = []
+                end_param: Any = "latest"
+                for b in range(batches):
+                    req = {
+                        "ticks_history": deriv_sym,
+                        "adjust_start_time": 1,
+                        "count": count,
+                        "end": end_param,
+                        "granularity": gran,
+                        "style": "candles",
+                        "req_id": 100 + b,
+                    }
+                    ws.send(json.dumps(req))
+                    raw = ws.recv()
+                    data = json.loads(raw)
+                    if "error" in data and data["error"]:
+                        raise RuntimeError(f"Deriv API error: {data['error'].get('message')}")
+                    cs = data.get("candles", [])
+                    if not cs:
+                        break
+                    all_candles.extend(cs)
+                    oldest = int(cs[0]["epoch"])
+                    if len(cs) < 200 or oldest <= 0:
+                        break
+                    end_param = oldest - 1
+
+                if not all_candles:
+                    continue
+                df = pd.DataFrame(all_candles)
+                # Normalize epoch to exact candle open boundary
+                df["epoch"] = (pd.to_numeric(df["epoch"], errors="coerce").astype("Int64") // gran) * gran
+                df["volume"] = 1.0
+                return normalize_ohlcv_df(df)
+            except Exception as exc:
+                log.debug("Deriv WS [%s/%s] %s failed: %s", ws_url, transport, deriv_sym, exc)
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+    return None
+
+
+def _ws_fetch_latest_tick(deriv_sym: str) -> Optional[Tuple[float, datetime]]:
+    for ws_url in _ws_candidate_urls():
+        ws = None
+        try:
+            ws = _RawTLSWebSocket(ws_url, timeout=HTTP_TIMEOUT_SEC, origin=DERIV_ORIGIN)
+            ws.send(json.dumps({
+                "ticks_history": deriv_sym,
+                "count": 1,
+                "end": "latest",
+                "style": "ticks",
+                "req_id": 777,
+            }))
+            data = json.loads(ws.recv())
+            hist = data.get("history", {})
+            prices = hist.get("prices", [])
+            times = hist.get("times", [])
+            if prices and times:
+                px = float(prices[-1])
+                ts = datetime.fromtimestamp(float(times[-1]), tz=TZ_UTC)
+                return px, ts
+        except Exception:
+            continue
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+    return None
+
+
+# ==============================================================================
+# 5. ZERO-API-KEY DATA SCRAPING, SANITATION & MICROSTRUCTURE ENGINE
+# ==============================================================================
+class _YahooCrumbClient:
+    """Direct Yahoo Finance v8 JSON fetcher using fc.yahoo.com cookie + crumb (zero API key)."""
+
+    def __init__(self) -> None:
+        self._crumb: Optional[str] = None
+        self._crumb_ts: float = 0.0
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+        })
+
+    def _ensure_crumb(self) -> str:
+        if self._crumb and (time.time() - self._crumb_ts) < 1800:
+            return self._crumb
+        try:
+            self._session.get("https://fc.yahoo.com", timeout=HTTP_TIMEOUT_SEC)
+        except Exception:
+            pass
+        r = self._session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        crumb = r.text.strip()
+        if not crumb or "<" in crumb:
+            raise RuntimeError("Invalid Yahoo crumb received")
+        self._crumb = crumb
+        self._crumb_ts = time.time()
+        return crumb
+
+    def fetch_chart(self, symbol: str, interval: str, range_str: str) -> Tuple[pd.DataFrame, Optional[float]]:
+        crumb = self._ensure_crumb()
+        url = (
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{quote(symbol)}"
+            f"?interval={interval}&range={range_str}&includePrePost=true&crumb={quote(crumb)}"
+        )
+        r = self._session.get(url, timeout=HTTP_TIMEOUT_SEC)
+        if r.status_code == 401:
+            self._crumb = None
+            crumb = self._ensure_crumb()
+            url = (
+                f"https://query2.finance.yahoo.com/v8/finance/chart/{quote(symbol)}"
+                f"?interval={interval}&range={range_str}&includePrePost=true&crumb={quote(crumb)}"
+            )
+            r = self._session.get(url, timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        data = r.json()
+        res_list = data.get("chart", {}).get("result") or []
+        if not res_list:
+            raise ValueError(f"Empty Yahoo result for {symbol}")
+        res = res_list[0]
+        ts = res.get("timestamp") or []
+        q = (res.get("indicators", {}).get("quote") or [{}])[0]
+        meta = res.get("meta") or {}
+        reg_px = meta.get("regularMarketPrice")
+        reg_price = float(reg_px) if reg_px is not None else None
+        if not ts or not q:
+            return pd.DataFrame(), reg_price
+
+        df = pd.DataFrame({
+            "timestamp": ts,
+            "open": q.get("open"),
+            "high": q.get("high"),
+            "low": q.get("low"),
+            "close": q.get("close"),
+            "volume": q.get("volume") or [1.0] * len(ts),
+        })
+        return normalize_ohlcv_df(df), reg_price
+
+    def fetch_meta_price(self, symbol: str) -> Optional[float]:
+        crumb = self._ensure_crumb()
+        url = (
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{quote(symbol)}"
+            f"?interval=1m&range=1d&includePrePost=true&crumb={quote(crumb)}"
+        )
+        r = self._session.get(url, timeout=HTTP_TIMEOUT_SEC)
+        if r.status_code == 401:
+            self._crumb = None
+            crumb = self._ensure_crumb()
+            url = (
+                f"https://query2.finance.yahoo.com/v8/finance/chart/{quote(symbol)}"
+                f"?interval=1m&range=1d&includePrePost=true&crumb={quote(crumb)}"
+            )
+            r = self._session.get(url, timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        res_list = r.json().get("chart", {}).get("result") or []
+        if not res_list:
+            return None
+        px = (res_list[0].get("meta") or {}).get("regularMarketPrice")
+        return float(px) if px is not None and float(px) > 0 else None
+
+
+_YAHOO = _YahooCrumbClient()
+
+
+def normalize_ohlcv_df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        raise ValueError("Empty OHLCV dataframe")
+    df = raw_df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    rename_map = {
+        "epoch": "timestamp",
+        "time": "timestamp",
+        "datetime": "timestamp",
+        "date": "timestamp",
+        "tick_volume": "volume",
+        "vol": "volume",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns and v not in df.columns})
+    for col in ("timestamp", "open", "high", "low", "close"):
+        if col not in df.columns:
+            raise ValueError(f"Missing column {col}")
+    if "volume" not in df.columns:
+        df["volume"] = 1.0
+
+    if pd.api.types.is_numeric_dtype(df["timestamp"]):
+        valid_ts = pd.to_numeric(df["timestamp"], errors="coerce").dropna()
+        if valid_ts.empty:
+            raise ValueError("All numeric timestamps are null")
+        unit = "ms" if float(valid_ts.iloc[0]) > 1e12 else "s"
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit=unit, utc=True, errors="coerce")
+    else:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    df = df[(df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0)].copy()
+    if df.empty:
+        raise ValueError("No valid positive OHLC rows")
+
+    df["volume"] = df["volume"].fillna(1.0).clip(lower=0.0)
+    df["high"] = df[["open", "high", "low", "close"]].max(axis=1)
+    df["low"] = df[["open", "high", "low", "close"]].min(axis=1)
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+    return df
+
+
+def resample_ohlcv_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    w = df_1h.copy().set_index("timestamp")
+    out = w.resample("4h", label="left", closed="left").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"]).reset_index()
+    return normalize_ohlcv_df(out)
+
+
+def _fetch_kraken_ohlc(pair: str, tf: str) -> Optional[pd.DataFrame]:
+    iv_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+    if tf not in iv_map:
+        return None
+    try:
+        r = request_with_backoff(
+            "GET",
+            "https://api.kraken.com/0/public/OHLC",
+            params={"pair": pair, "interval": iv_map[tf]},
+        )
+        payload = r.json()
+        if payload.get("error"):
+            return None
+        res = payload.get("result", {})
+        key = next((k for k in res.keys() if k != "last"), None)
+        if not key:
+            return None
+        rows = res[key]
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "vwap", "volume", "count"])
+        return normalize_ohlcv_df(df[["timestamp", "open", "high", "low", "close", "volume"]])
+    except Exception:
+        return None
+
+
+def _fetch_coinbase_ohlc(product: str, tf: str, batches: int = 4) -> Optional[pd.DataFrame]:
+    gran_map = {"5m": 300, "15m": 900, "1h": 3600}
+    if tf not in gran_map:
+        return None
+    gran = gran_map[tf]
+    all_rows: List[List[Any]] = []
+    end_dt = utc_now()
+    try:
+        for _ in range(batches):
+            start_dt = end_dt - timedelta(seconds=gran * 290)
+            r = request_with_backoff(
+                "GET",
+                f"https://api.exchange.coinbase.com/products/{product}/candles",
+                params={"granularity": gran, "start": start_dt.isoformat(), "end": end_dt.isoformat()},
+            )
+            batch = r.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            all_rows.extend(batch)
+            end_dt = start_dt - timedelta(seconds=gran)
+            time.sleep(0.12)
+        if not all_rows:
+            return None
+        df = pd.DataFrame(all_rows, columns=["timestamp", "low", "high", "open", "close", "volume"])
+        return normalize_ohlcv_df(df[["timestamp", "open", "high", "low", "close", "volume"]])
+    except Exception:
+        return None
+
+
+def _fetch_okx_ohlc(inst_id: str, tf: str, batches: int = 4) -> Optional[pd.DataFrame]:
+    bar_map = {"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H"}
+    if tf not in bar_map:
+        return None
+    rows: List[List[Any]] = []
+    after: Optional[str] = None
+    try:
+        for _ in range(batches):
+            params: Dict[str, Any] = {"instId": inst_id, "bar": bar_map[tf], "limit": 300}
+            if after:
+                params["after"] = after
+            r = request_with_backoff("GET", "https://www.okx.com/api/v5/market/candles", params=params)
+            data = r.json().get("data") or []
+            if not data:
+                break
+            rows.extend(data)
+            after = str(data[-1][0])
+            time.sleep(0.1)
+        if not rows:
+            return None
+        df = pd.DataFrame([c[:6] for c in rows], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        return normalize_ohlcv_df(df)
+    except Exception:
+        return None
+
+
+def _fetch_twelvedata_optional(symbol: str, tf: str, size: int) -> Optional[pd.DataFrame]:
+    if not TD_API_KEY:
+        return None
+    iv_map = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
+    try:
+        r = request_with_backoff(
+            "GET",
+            "https://api.twelvedata.com/time_series",
+            params={"symbol": symbol, "interval": iv_map[tf], "outputsize": min(size, 4500), "timezone": "UTC", "apikey": TD_API_KEY},
+        )
+        data = r.json()
+        if "values" not in data:
+            return None
+        df = pd.DataFrame(data["values"])
+        df = df.rename(columns={"datetime": "timestamp"})
+        return normalize_ohlcv_df(df)
+    except Exception:
+        return None
+
+
+def _fetch_tv_quote(market: str, tickers: List[str]) -> Optional[Dict[str, Any]]:
+    try:
+        r = request_with_backoff(
+            "POST",
+            f"https://scanner.tradingview.com/{market}/scan",
+            json={"symbols": {"tickers": tickers}, "columns": ["close", "bid", "ask", "high", "low", "open"]},
+        )
+        items = r.json().get("data") or []
+        prices: List[float] = []
+        bids: List[float] = []
+        asks: List[float] = []
+        for item in items:
+            d = item.get("d") or []
+            if len(d) >= 3:
+                c, b, a = d[0], d[1], d[2]
+                if c is not None and float(c) > 0:
+                    prices.append(float(c))
+                if b is not None and a is not None and float(b) > 0 and float(a) > 0 and float(a) >= float(b):
+                    bids.append(float(b))
+                    asks.append(float(a))
+        if not prices:
+            return None
+        return {
+            "mid": float(np.median(prices)),
+            "bid": float(np.median(bids)) if bids else None,
+            "ask": float(np.median(asks)) if asks else None,
+            "all_prices": prices,
+        }
+    except Exception:
+        return None
+
+
+def _fetch_swissquote_xau() -> Optional[Dict[str, Any]]:
+    try:
+        r = request_with_backoff(
+            "GET",
+            "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
+        )
+        arr = r.json()
+        if not arr or not isinstance(arr, list):
+            return None
+        profiles = arr[0].get("spreadProfilePrices") or []
+        best = None
+        for pref in ("elite", "prime", "premium", "standard"):
+            best = next((p for p in profiles if str(p.get("spreadProfile", "")).lower() == pref), None)
+            if best:
+                break
+        if best is None and profiles:
+            best = profiles[0]
+        if not best:
+            return None
+        bid = float(best["bid"])
+        ask = float(best["ask"])
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": 0.5 * (bid + ask),
+            "spread": max(0.0, ask - bid),
+            "ts": utc_now(),
+        }
+    except Exception:
+        return None
+
+
+def fetch_live_microstructure(inst: str, ref_close: float) -> Dict[str, Any]:
+    """
+    Zero-API-key real-time Bid/Ask/Spread & Cross-Venue Verification for ALL 4 assets.
+    """
+    cfg = INSTRUMENTS[inst]
+    default_spread = float(cfg["costs"]["spread_px"])
+    out: Dict[str, Any] = {
+        "price": float(ref_close),
+        "bid": float(ref_close) - 0.5 * default_spread,
+        "ask": float(ref_close) + 0.5 * default_spread,
+        "spread": default_spread,
+        "cross_div_pct": 0.0,
+        "venues": 0,
+        "source": "CANDLE_REF",
+        "ts": utc_now(),
+    }
+
+    if inst in ("BTCUSD", "ETHUSD"):
+        mids: List[float] = []
+        spreads: List[float] = []
+        bids: List[float] = []
+        asks: List[float] = []
+        sources: List[str] = []
+
+        # 1. Coinbase Exchange
+        try:
+            cb_p = cfg["coinbase_pair"]
+            r = request_with_backoff("GET", f"https://api.exchange.coinbase.com/products/{cb_p}/ticker", max_retries=2)
+            j = r.json()
+            b = float(j["bid"])
+            a = float(j["ask"])
+            if b > 0 and a >= b:
+                mids.append(0.5 * (b + a))
+                bids.append(b)
+                asks.append(a)
+                spreads.append(a - b)
+                sources.append("Coinbase")
+        except Exception:
+            pass
+
+        # 2. Kraken Public Ticker
+        try:
+            kr_p = cfg["kraken_pair"]
+            r = request_with_backoff("GET", "https://api.kraken.com/0/public/Ticker", params={"pair": kr_p}, max_retries=2)
+            res = r.json().get("result") or {}
+            first = next(iter(res.values()), None)
+            if first:
+                b = float(first["b"][0])
+                a = float(first["a"][0])
+                if b > 0 and a >= b:
+                    mids.append(0.5 * (b + a))
+                    bids.append(b)
+                    asks.append(a)
+                    spreads.append(a - b)
+                    sources.append("Kraken")
+        except Exception:
+            pass
+
+        # 3. OKX Public Ticker
+        try:
+            okx_i = cfg["okx_inst"]
+            r = request_with_backoff("GET", "https://www.okx.com/api/v5/market/ticker", params={"instId": okx_i}, max_retries=2)
+            arr = r.json().get("data") or []
+            if arr:
+                b = float(arr[0]["bidPx"])
+                a = float(arr[0]["askPx"])
+                if b > 0 and a >= b:
+                    mids.append(0.5 * (b + a))
+                    bids.append(b)
+                    asks.append(a)
+                    spreads.append(a - b)
+                    sources.append("OKX")
+        except Exception:
+            pass
+
+        # 4. Bitstamp Public Ticker
+        try:
+            bs_p = cfg["bitstamp_pair"]
+            r = request_with_backoff("GET", f"https://www.bitstamp.net/api/v2/ticker/{bs_p}/", max_retries=2)
+            j = r.json()
+            b = float(j["bid"])
+            a = float(j["ask"])
+            if b > 0 and a >= b:
+                mids.append(0.5 * (b + a))
+                bids.append(b)
+                asks.append(a)
+                spreads.append(a - b)
+                sources.append("Bitstamp")
+        except Exception:
+            pass
+
+        if mids:
+            med_mid = float(np.median(mids))
+            max_div = max(abs(m - med_mid) / max(med_mid, EPSILON) * 100.0 for m in mids) if len(mids) >= 2 else 0.0
+            out.update({
+                "price": med_mid,
+                "bid": float(np.median(bids)),
+                "ask": float(np.median(asks)),
+                "spread": max(float(np.median(spreads)), cfg["contract"]["tick"]),
+                "cross_div_pct": max_div,
+                "venues": len(mids),
+                "source": "+".join(sources),
+                "ts": utc_now(),
+            })
+        return out
+
+    if inst == "XAUUSD":
+        mids, spreads, bids, asks, sources = [], [], [], [], []
+        sq = _fetch_swissquote_xau()
+        if sq:
+            mids.append(sq["mid"])
+            bids.append(sq["bid"])
+            asks.append(sq["ask"])
+            spreads.append(sq["spread"])
+            sources.append("Swissquote")
+        tv = _fetch_tv_quote("cfd", cfg["tv_tickers"])
+        if tv:
+            mids.extend(tv["all_prices"])
+            if tv["bid"] and tv["ask"]:
+                bids.append(tv["bid"])
+                asks.append(tv["ask"])
+                spreads.append(tv["ask"] - tv["bid"])
+            sources.append("TradingView")
+        deriv_tk = _ws_fetch_latest_tick("frxXAUUSD")
+        if deriv_tk and deriv_tk[0] > 0:
+            mids.append(deriv_tk[0])
+            sources.append("DerivWS")
+
+        if mids:
+            med_mid = float(np.median(mids))
+            max_div = max(abs(m - med_mid) / max(med_mid, EPSILON) * 100.0 for m in mids) if len(mids) >= 2 else 0.0
+            out.update({
+                "price": med_mid,
+                "bid": float(np.median(bids)) if bids else med_mid - 0.5 * default_spread,
+                "ask": float(np.median(asks)) if asks else med_mid + 0.5 * default_spread,
+                "spread": float(np.median(spreads)) if spreads else default_spread,
+                "cross_div_pct": max_div,
+                "venues": len(sources),
+                "source": "+".join(sources),
+                "ts": utc_now(),
+            })
+        return out
+
+    if inst == "NAS100":
+        mids, sources = [], []
+        tv = _fetch_tv_quote("futures", cfg["tv_tickers"])
+        if tv:
+            mids.append(tv["mid"])
+            sources.append("TV_NQ1")
+        try:
+            reg_px = _YAHOO.fetch_meta_price("NQ=F")
+            if reg_px and reg_px > 0:
+                mids.append(reg_px)
+                sources.append("YahooNQ")
+        except Exception:
+            pass
+        if mids:
+            med_mid = float(np.median(mids))
+            max_div = max(abs(m - med_mid) / max(med_mid, EPSILON) * 100.0 for m in mids) if len(mids) >= 2 else 0.0
+            out.update({
+                "price": med_mid,
+                "bid": med_mid - 0.5 * default_spread,
+                "ask": med_mid + 0.5 * default_spread,
+                "spread": default_spread,
+                "cross_div_pct": max_div,
+                "venues": len(sources),
+                "source": "+".join(sources),
+                "ts": utc_now(),
+            })
+        return out
+
+    return out
+
+
+def _save_cache(df: pd.DataFrame, inst: str, tf: str) -> None:
+    try:
+        os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+        path = os.path.join(LOCAL_DATA_DIR, f"{inst}_{tf}.csv")
+        s = df.copy()
+        s["timestamp"] = s["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        s.to_csv(path, index=False)
+    except Exception:
+        pass
+
+
+def _load_cache(inst: str, tf: str) -> Optional[pd.DataFrame]:
+    path = os.path.join(LOCAL_DATA_DIR, f"{inst}_{tf}.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        return normalize_ohlcv_df(pd.read_csv(path))
+    except Exception:
+        return None
+
+
+def sanitize_and_drop_incomplete(df: pd.DataFrame, tf: str, live_mode: bool = True) -> pd.DataFrame:
+    df = normalize_ohlcv_df(df)
+    if live_mode and len(df) >= 2:
+        tf_sec = TF_SECONDS[tf]
+        now_ep = utc_now().timestamp()
+        last_ep = df["timestamp"].iloc[-1].timestamp()
+        # Drop currently forming candle so indicators evaluate strictly on closed candles
+        if (now_ep - last_ep) < tf_sec * 0.96:
+            df = df.iloc[:-1].copy().reset_index(drop=True)
+    if len(df) < 30:
+        return df
+
+    # Anomaly spike guard: remove impossible single-bar corruptions (e.g., 10x ATR outlier tick)
+    rng = df["high"] - df["low"]
+    med_rng = rng.rolling(30, min_periods=10).median().ffill().bfill()
+    valid = (rng <= med_rng * 9.0) | (med_rng <= 0)
+    if valid.sum() >= 30 and not valid.all():
+        df = df[valid].copy().reset_index(drop=True)
+    return df
+
+
+def fetch_candles(inst: str, tf: str, deep: bool = False) -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    Zero-API-key multi-source OHLCV fetcher with exact Spot/Futures discipline.
+    """
+    cfg = INSTRUMENTS[inst]
+    min_bars = 450 if deep else 180
+
+    # --- 4h can always be resampled cleanly from deep 1h if direct 4h lacks depth ---
+    if tf == "4h":
+        df_1h, src_1h = fetch_candles(inst, "1h", deep=deep)
+        if df_1h is not None and len(df_1h) >= 80:
+            df_4h = resample_ohlcv_4h(df_1h)
+            df_4h = sanitize_and_drop_incomplete(df_4h, "4h", live_mode=True)
+            if len(df_4h) >= 40:
+                _save_cache(df_4h, inst, "4h")
+                return df_4h, f"{src_1h}->4H"
+
+    # --- CRYPTO: Kraken + Coinbase + OKX + Deriv WS + Yahoo Crumb ---
+    if inst in ("BTCUSD", "ETHUSD"):
+        if not deep:
+            df = _fetch_kraken_ohlc(cfg["kraken_pair"], tf)
+            if df is not None:
+                df = sanitize_and_drop_incomplete(df, tf)
+                if len(df) >= min_bars:
+                    _save_cache(df, inst, tf)
+                    return df, "Kraken"
+
+        df = _fetch_coinbase_ohlc(cfg["coinbase_pair"], tf, batches=8 if deep else 2)
+        if df is not None:
+            df = sanitize_and_drop_incomplete(df, tf)
+            if len(df) >= min_bars:
+                _save_cache(df, inst, tf)
+                return df, "Coinbase"
+
+        if cfg.get("deriv_sym") and tf in ("5m", "15m", "1h"):
+            df = _ws_fetch_candles(cfg["deriv_sym"], TF_SECONDS[tf], batches=2 if deep else 1, count=2000)
+            if df is not None:
+                df = sanitize_and_drop_incomplete(df, tf)
+                if len(df) >= min_bars:
+                    _save_cache(df, inst, tf)
+                    return df, "DerivWS"
+
+        df = _fetch_okx_ohlc(cfg["okx_inst"], tf, batches=6 if deep else 2)
+        if df is not None:
+            df = sanitize_and_drop_incomplete(df, tf)
+            if len(df) >= 80:
+                _save_cache(df, inst, tf)
+                return df, "OKX"
+
+        try:
+            rng_str = "60d" if tf in ("5m", "15m") else "730d"
+            df_yf, _ = _YAHOO.fetch_chart(cfg["yf"], tf, rng_str if deep else ("14d" if tf == "15m" else "90d"))
+            df_yf = sanitize_and_drop_incomplete(df_yf, tf)
+            if len(df_yf) >= 80:
+                _save_cache(df_yf, inst, tf)
+                return df_yf, "YahooCrumb"
+        except Exception:
+            pass
+
+    # --- XAUUSD: Pure Spot Deriv WS (frxXAUUSD) -> Optional TD -> Basis-Adjusted GC=F ---
+    elif inst == "XAUUSD":
+        if cfg.get("deriv_sym") and tf in ("5m", "15m", "1h"):
+            df = _ws_fetch_candles(cfg["deriv_sym"], TF_SECONDS[tf], batches=2 if deep else 1, count=1800)
+            if df is not None:
+                df = sanitize_and_drop_incomplete(df, tf)
+                if len(df) >= 120:
+                    _save_cache(df, inst, tf)
+                    return df, "DerivWS_Spot"
+
+        df_td = _fetch_twelvedata_optional(cfg["td"], tf, 3500 if deep else 450)
+        if df_td is not None:
+            df_td = sanitize_and_drop_incomplete(df_td, tf)
+            if len(df_td) >= 120:
+                _save_cache(df_td, inst, tf)
+                return df_td, "TwelveData"
+
+        try:
+            rng_str = "60d" if tf in ("5m", "15m") else "365d"
+            df_gc, gc_reg = _YAHOO.fetch_chart("GC=F", tf, rng_str if deep else ("14d" if tf == "15m" else "60d"))
+            df_gc = sanitize_and_drop_incomplete(df_gc, tf)
+            sq = _fetch_swissquote_xau()
+            if sq and gc_reg and gc_reg > 0:
+                basis = sq["mid"] - gc_reg
+                if abs(basis) < 120.0:
+                    for c in ("open", "high", "low", "close"):
+                        df_gc[c] = df_gc[c] + basis
+            if len(df_gc) >= 80:
+                _save_cache(df_gc, inst, tf)
+                return df_gc, "YahooGC_BasisAdj"
+        except Exception:
+            pass
+
+    # --- NAS100: Yahoo Crumb NQ=F -> yfinance NQ=F -> Optional TD ---
+    elif inst == "NAS100":
+        try:
+            rng_str = "60d" if tf in ("5m", "15m") else "365d"
+            df_nq, _ = _YAHOO.fetch_chart("NQ=F", tf, rng_str if deep else ("14d" if tf == "15m" else "90d"))
+            df_nq = sanitize_and_drop_incomplete(df_nq, tf)
+            if len(df_nq) >= 80:
+                _save_cache(df_nq, inst, tf)
+                return df_nq, "YahooNQ_Crumb"
+        except Exception as exc:
+            log.debug("YahooCrumb NQ=F %s failed: %s", tf, exc)
+
+        if yf is not None:
+            try:
+                prd = "60d" if tf in ("5m", "15m") else "365d"
+                raw = yf.download("NQ=F", period=prd if deep else ("14d" if tf == "15m" else "90d"), interval=tf, progress=False, auto_adjust=False)
+                if raw is not None and not raw.empty:
+                    raw = raw.reset_index()
+                    df_yf = sanitize_and_drop_incomplete(raw, tf)
+                    if len(df_yf) >= 80:
+                        _save_cache(df_yf, inst, tf)
+                        return df_yf, "yfinance_NQ"
+            except Exception:
+                pass
+
+        df_td = _fetch_twelvedata_optional(cfg["td"], tf, 3500 if deep else 450)
+        if df_td is not None:
+            df_td = sanitize_and_drop_incomplete(df_td, tf)
+            if len(df_td) >= 80:
+                _save_cache(df_td, inst, tf)
+                return df_td, "TwelveData"
+
+    cached = _load_cache(inst, tf)
+    if cached is not None and len(cached) >= 80:
+        return cached, "LOCAL_CACHE"
+    return None, "UNAVAILABLE"
+
+
+# ==============================================================================
+# 6. MARKET SESSIONS & CALENDAR GUARDS
+# ==============================================================================
+def is_market_open(inst: str, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
+    now = now_utc or utc_now()
+    if inst in ("BTCUSD", "ETHUSD"):
+        return True, "24/7_CRYPTO"
+    ny = now.astimezone(TZ_NY)
+    wd = ny.weekday()  # Mon=0 .. Sun=6
+    hm = ny.hour * 60 + ny.minute
+    # CME / Spot Gold FX schedule in NY time: Closed Friday >=17:00, All Saturday, Sunday <18:00
+    # Plus daily CME maintenance 17:00-18:00 NY
+    if wd == 5:
+        return False, "WEEKEND_CLOSED"
+    if wd == 4 and hm >= 17 * 60:
+        return False, "WEEKEND_CLOSED"
+    if wd == 6 and hm < 18 * 60:
+        return False, "WEEKEND_CLOSED"
+    if 17 * 60 <= hm < 18 * 60:
+        return False, "DAILY_MAINTENANCE_17_18NY"
+    return True, "OPEN"
+
+
+def scalping_session_ok(inst: str, ts_utc: datetime) -> bool:
+    if inst in ("BTCUSD", "ETHUSD"):
+        # Avoid dead low-liquidity rollover hours 22:00-00:30 UTC? Keep open 24/7 except 00:00 rollover 15m
+        return True
+    ldn = ts_utc.astimezone(TZ_LDN)
+    ny = ts_utc.astimezone(TZ_NY)
+    # Institutional London + NY liquid sessions: London 07:00-12:00 OR NY 08:00-16:00
+    in_ldn = 7 <= ldn.hour < 12
+    in_ny = 8 <= ny.hour < 16
+    return in_ldn or in_ny
+
+
+def check_candle_freshness(inst: str, tf: str, df: pd.DataFrame, max_stale_min: int) -> Tuple[bool, float]:
+    if df is None or df.empty:
+        return False, 9e9
+    last_ts = df["timestamp"].iloc[-1].to_pydatetime()
+    # Last closed bar open + TF duration = close time; age measured from close time
+    tf_sec = TF_SECONDS[tf]
+    close_ts = last_ts + timedelta(seconds=tf_sec)
+    age_min = max(0.0, (utc_now() - close_ts).total_seconds() / 60.0)
+    return age_min <= float(max_stale_min), age_min
+
+
+# ==============================================================================
+# 7. TECHNICAL INDICATORS & MULTI-TIMEFRAME REGIME/SCORING ENGINE
+# ==============================================================================
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def rma(s: pd.Series, period: int) -> pd.Series:
+    return s.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    pc = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return rma(tr, period)
+
+
+def rsi_series(c: pd.Series, period: int = 14) -> pd.Series:
+    d = c.diff()
+    up = rma(d.clip(lower=0.0), period)
+    dn = rma((-d).clip(lower=0.0), period)
+    rs = up / dn.replace(0.0, np.nan)
+    return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+
+
+def adx_series(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    h, l, c = df["high"], df["low"], df["close"]
+    up = h.diff()
+    dn = -l.diff()
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    atr_v = atr_series(df, period).replace(0.0, np.nan)
+    pdi = 100.0 * rma(pdm, period) / atr_v
+    mdi = 100.0 * rma(mdm, period) / atr_v
+    dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan)
+    return rma(dx, period).fillna(0.0), pdi.fillna(0.0), mdi.fillna(0.0)
+
+
+def efficiency_ratio(c: pd.Series, period: int = 20) -> pd.Series:
+    net = (c - c.shift(period)).abs()
+    path = c.diff().abs().rolling(period).sum().replace(0.0, np.nan)
+    return (net / path).fillna(0.0)
+
+
+def choppiness_index(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    pc = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    tr_sum = tr.rolling(period).sum()
+    hh = h.rolling(period).max()
+    ll = l.rolling(period).min()
+    rng = (hh - ll).replace(0.0, np.nan)
+    ratio = (tr_sum / rng).clip(lower=1.0)
+    return (100.0 * np.log10(ratio) / np.log10(period)).fillna(50.0)
+
+
+def bollinger_keltner_squeeze(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd.Series]:
+    c = df["close"]
+    sma = c.rolling(period).mean()
+    std = c.rolling(period).std(ddof=0)
+    bb_up, bb_dn = sma + 2.0 * std, sma - 2.0 * std
+    e20 = ema(c, period)
+    atr_v = atr_series(df, period)
+    kc_up, kc_dn = e20 + 1.5 * atr_v, e20 - 1.5 * atr_v
+    sq_on = (bb_up < kc_up) & (bb_dn > kc_dn)
+    bb_w = ((bb_up - bb_dn) / sma.replace(0.0, np.nan)).fillna(0.0)
+    return sq_on.fillna(False), bb_w
+
+
+def rolling_vwap_z(df: pd.DataFrame, window: int = 48) -> Tuple[pd.Series, pd.Series]:
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol = df["volume"].where(df["volume"] > 0, 1.0)
+    # If all volumes equal (e.g., Deriv synthetic tick-less candles), use equal weights cleanly
+    pv = tp * vol
+    vwap = pv.rolling(window, min_periods=10).sum() / vol.rolling(window, min_periods=10).sum()
+    std = (df["close"] - vwap).rolling(window, min_periods=10).std(ddof=0).replace(0.0, np.nan)
+    z = ((df["close"] - vwap) / std).fillna(0.0)
+    return vwap.fillna(df["close"]), z
+
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    w = df.copy()
+    c = w["close"]
+    w["ema20"] = ema(c, 20)
+    w["ema50"] = ema(c, 50)
+    w["ema200"] = ema(c, 200)
+    w["ema50_slope"] = w["ema50"] - w["ema50"].shift(4)
+    w["atr"] = atr_series(w, 14)
+    w["atr_med"] = w["atr"].rolling(100, min_periods=20).median().ffill().bfill()
+    w["rsi"] = rsi_series(c, 14)
+    w["adx"], w["pdi"], w["mdi"] = adx_series(w, 14)
+    w["er"] = efficiency_ratio(c, 20)
+    w["chop"] = choppiness_index(w, 14)
+    w["sq_on"], w["bb_w"] = bollinger_keltner_squeeze(w, 20)
+    w["vwap"], w["vwap_z"] = rolling_vwap_z(w, 48)
+    # Donchian channels strictly shifted by 1 bar (zero lookahead!)
+    w["don_hi"] = w["high"].rolling(20).max().shift(1)
+    w["don_lo"] = w["low"].rolling(20).min().shift(1)
+    # MACD Histogram
+    macd_line = ema(c, 12) - ema(c, 26)
+    w["macd_hist"] = macd_line - ema(macd_line, 9)
+
+    # Non-lookahead confirmed pivot swing high/low (pivot lag p=3 -> confirmed p bars later)
+    p = 3
+    roll_hi = w["high"].rolling(2 * p + 1).max()
+    roll_lo = w["low"].rolling(2 * p + 1).min()
+    piv_hi = w["high"].shift(p).where(w["high"].shift(p) == roll_hi)
+    piv_lo = w["low"].shift(p).where(w["low"].shift(p) == roll_lo)
+    w["last_piv_hi"] = piv_hi.ffill()
+    w["last_piv_lo"] = piv_lo.ffill()
+    # Structural room barriers (48-bar prior range)
+    w["struct_res"] = w["high"].rolling(48, min_periods=12).max().shift(1)
+    w["struct_sup"] = w["low"].rolling(48, min_periods=12).min().shift(1)
+    # Recent stop sweep levels
+    w["sw_lo"] = w["low"].rolling(10).min()
+    w["sw_hi"] = w["high"].rolling(10).max()
+    # Volume ratio (neutral 1.0 when volume is flat synthetic)
+    vol_mean = w["volume"].rolling(20, min_periods=5).mean()
+    has_real_vol = w["volume"].rolling(20).std().fillna(0.0) > 0
+    w["vol_ratio"] = np.where(has_real_vol & (vol_mean > 0), w["volume"] / vol_mean, 1.0)
+    return w
+
+
+def align_htf_to_ltf(ltf_df: pd.DataFrame, htf_df: pd.DataFrame, htf_tf: str) -> pd.DataFrame:
+    """
+    Causal HTF->LTF merge_asof: each HTF candle only becomes visible AFTER its close time
+    (open_ts + tf_seconds), guaranteeing 100% zero lookahead in backtest & live.
+    """
+    l = ltf_df.sort_values("timestamp").reset_index(drop=True)
+    h = htf_df.sort_values("timestamp").copy()
+    h["htf_avail_ts"] = h["timestamp"] + pd.to_timedelta(TF_SECONDS[htf_tf], unit="s")
+    cols = ["htf_avail_ts", "close", "ema50", "ema200", "ema50_slope", "adx", "rsi", "macd_hist", "struct_res", "struct_sup"]
+    h_sub = h[cols].rename(columns={
+        "close": "h_close",
+        "ema50": "h_ema50",
+        "ema200": "h_ema200",
+        "ema50_slope": "h_slope",
+        "adx": "h_adx",
+        "rsi": "h_rsi",
+        "macd_hist": "h_macd",
+        "struct_res": "h_res",
+        "struct_sup": "h_sup",
+    })
+    merged = pd.merge_asof(
+        l,
+        h_sub.sort_values("htf_avail_ts"),
+        left_on="timestamp",
+        right_on="htf_avail_ts",
+        direction="backward",
+    )
+    return merged
+
+
+def precompute_signals(
+    inst: str,
+    mode: str,
+    ltf_df: pd.DataFrame,
+    htf_df: pd.DataFrame,
+) -> Dict[str, np.ndarray]:
+    """
+    Vectorized/fast precomputation of bull/bear scores, setups, regimes, ATR, structural levels,
+    and session filters across all LTF bars with strict zero lookahead.
+    """
+    cfg = INSTRUMENTS[inst]
+    mcfg = cfg[mode]
+    ltf_i = compute_indicators(ltf_df)
+    htf_i = compute_indicators(htf_df)
+    df = align_htf_to_ltf(ltf_i, htf_i, mcfg["htf"])
+
+    n = len(df)
+    o = df["open"].to_numpy(dtype=np.float64)
+    h = df["high"].to_numpy(dtype=np.float64)
+    l = df["low"].to_numpy(dtype=np.float64)
+    c = df["close"].to_numpy(dtype=np.float64)
+    e20 = df["ema20"].to_numpy(dtype=np.float64)
+    e50 = df["ema50"].to_numpy(dtype=np.float64)
+    e200 = df["ema200"].to_numpy(dtype=np.float64)
+    atr_a = df["atr"].to_numpy(dtype=np.float64)
+    atr_med = df["atr_med"].to_numpy(dtype=np.float64)
+    rsi_a = df["rsi"].to_numpy(dtype=np.float64)
+    adx_a = df["adx"].to_numpy(dtype=np.float64)
+    pdi_a = df["pdi"].to_numpy(dtype=np.float64)
+    mdi_a = df["mdi"].to_numpy(dtype=np.float64)
+    er_a = df["er"].to_numpy(dtype=np.float64)
+    chop_a = df["chop"].to_numpy(dtype=np.float64)
+    sq_a = df["sq_on"].to_numpy(dtype=bool)
+    vwap_a = df["vwap"].to_numpy(dtype=np.float64)
+    vz_a = df["vwap_z"].to_numpy(dtype=np.float64)
+    d_hi = df["don_hi"].to_numpy(dtype=np.float64)
+    d_lo = df["don_lo"].to_numpy(dtype=np.float64)
+    macd_a = df["macd_hist"].to_numpy(dtype=np.float64)
+    sw_l = df["sw_lo"].to_numpy(dtype=np.float64)
+    sw_h = df["sw_hi"].to_numpy(dtype=np.float64)
+    vol_r = df["vol_ratio"].to_numpy(dtype=np.float64)
+
+    hc = df["h_close"].to_numpy(dtype=np.float64)
+    he50 = df["h_ema50"].to_numpy(dtype=np.float64)
+    he200 = df["h_ema200"].to_numpy(dtype=np.float64)
+    hsl = df["h_slope"].to_numpy(dtype=np.float64)
+    hadx = df["h_adx"].to_numpy(dtype=np.float64)
+    hrsi = df["h_rsi"].to_numpy(dtype=np.float64)
+    hmacd = df["h_macd"].to_numpy(dtype=np.float64)
+    hres = df["h_res"].to_numpy(dtype=np.float64)
+    hsup = df["h_sup"].to_numpy(dtype=np.float64)
+
+    ts_list = df["timestamp"].tolist()
+    sess_ok = np.array([scalping_session_ok(inst, t.to_pydatetime()) if mode == "scalp" else True for t in ts_list], dtype=bool)
+
+    b_scores = np.zeros(n, dtype=np.int32)
+    s_scores = np.zeros(n, dtype=np.int32)
+    b_setups = np.empty(n, dtype=object)
+    s_setups = np.empty(n, dtype=object)
+    regimes = np.empty(n, dtype=object)
+
+    min_atr = float(mcfg["min_atr_px"])
+    min_adx = float(mcfg["min_adx"])
+    min_er = float(mcfg["min_er"])
+    max_chop = float(mcfg["max_chop"])
+
+    for i in range(60, n):
+        regimes[i] = "CHOP"
+        b_setups[i] = "NONE"
+        s_setups[i] = "NONE"
+
+        if np.isnan(hc[i]) or np.isnan(he200[i]) or np.isnan(d_hi[i]) or np.isnan(atr_a[i]):
+            continue
+        atr = atr_a[i]
+        if atr < max(min_atr, atr_med[i] * 0.28):
+            regimes[i] = "LOW_VOL"
+            continue
+
+        rng = max(h[i] - l[i], EPSILON)
+        body = abs(c[i] - o[i])
+        body_ratio = body / rng
+        close_pos = (c[i] - l[i]) / rng
+
+        # Regime classification
+        h_bull = (he50[i] > he200[i]) and (hc[i] > he50[i]) and (hsl[i] > 0)
+        h_bear = (he50[i] < he200[i]) and (hc[i] < he50[i]) and (hsl[i] < 0)
+        quality_ok = (adx_a[i] >= min_adx) and (er_a[i] >= min_er) and (chop_a[i] <= max_chop)
+        if not quality_ok:
+            regimes[i] = "RANGE_CHOP"
+            continue
+
+        if h_bull:
+            regimes[i] = "BULL_TREND"
+        elif h_bear:
+            regimes[i] = "BEAR_TREND"
+        else:
+            regimes[i] = "TRANSITION"
+
+        # ------------------------------------------------------------------
+        # 1. HTF Alignment + Macro Bias (0 - 35 pts)
+        # ------------------------------------------------------------------
+        htf_b = 0.0
+        htf_s = 0.0
+        if he50[i] > he200[i]:
+            htf_b += 12.0
+        elif he50[i] < he200[i]:
+            htf_s += 12.0
+        if hc[i] > he50[i]:
+            htf_b += 8.0
+        elif hc[i] < he50[i]:
+            htf_s += 8.0
+        if hsl[i] > 0:
+            htf_b += 6.0
+        elif hsl[i] < 0:
+            htf_s += 6.0
+        if hrsi[i] >= 52.0 and hmacd[i] > 0:
+            htf_b += 9.0
+        elif hrsi[i] <= 48.0 and hmacd[i] < 0:
+            htf_s += 9.0
+        elif hrsi[i] >= 50.0:
+            htf_b += 4.0
+        elif hrsi[i] <= 50.0:
+            htf_s += 4.0
+
+        # ------------------------------------------------------------------
+        # 2. LTF Trend Structure & Momentum (0 - 35 pts)
+        # ------------------------------------------------------------------
+        ltf_b = 0.0
+        ltf_s = 0.0
+        if c[i] > e20[i] > e50[i]:
+            ltf_b += 12.0
+        elif c[i] > e50[i]:
+            ltf_b += 6.0
+        if c[i] < e20[i] < e50[i]:
+            ltf_s += 12.0
+        elif c[i] < e50[i]:
+            ltf_s += 6.0
+
+        if pdi_a[i] > mdi_a[i] and macd_a[i] > 0 and macd_a[i] >= macd_a[i - 1]:
+            ltf_b += 10.0
+        elif pdi_a[i] > mdi_a[i]:
+            ltf_b += 5.0
+        if mdi_a[i] > pdi_a[i] and macd_a[i] < 0 and macd_a[i] <= macd_a[i - 1]:
+            ltf_s += 10.0
+        elif mdi_a[i] > pdi_a[i]:
+            ltf_s += 5.0
+
+        if adx_a[i] >= min_adx + 5.0:
+            ltf_b += 6.0
+            ltf_s += 6.0
+        elif adx_a[i] >= min_adx:
+            ltf_b += 3.0
+            ltf_s += 3.0
+
+        if er_a[i] >= 0.30:
+            ltf_b += 7.0
+            ltf_s += 7.0
+        elif er_a[i] >= min_er:
+            ltf_b += 4.0
+            ltf_s += 4.0
+
+        # ------------------------------------------------------------------
+        # 3. Trigger Setups & Candle Anatomy (0 - 30 pts)
+        # ------------------------------------------------------------------
+        recent_sq = bool(sq_a[i - 1] or sq_a[i - 2] or sq_a[i - 3])
+        vol_boost = vol_r[i] >= 1.12
+
+        # Bull triggers
+        bull_brk = (c[i] > d_hi[i]) and (c[i - 1] <= d_hi[i] * 1.0005) and (close_pos >= 0.58) and (body_ratio >= 0.35)
+        pullback_zone_b = (l[i] <= e20[i] + 0.25 * atr) or (l[i - 1] <= e20[i - 1] + 0.20 * atr) or (l[i] <= vwap_a[i] + 0.2 * atr)
+        bull_pb = (
+            pullback_zone_b
+            and (c[i] > o[i])
+            and (c[i] > h[i - 1] or close_pos >= 0.62)
+            and (c[i] > e20[i])
+            and (38.0 <= rsi_a[i] <= 66.0)
+            and (rsi_a[i] > rsi_a[i - 1])
+        )
+        bull_mom = (c[i] > e20[i]) and (c[i] > vwap_a[i]) and (macd_a[i] > 0) and (macd_a[i - 1] <= 0) and (close_pos >= 0.58)
+
+        trig_b = 0.0
+        if bull_brk:
+            trig_b = 20.0 + (5.0 if recent_sq else 0.0) + (5.0 if vol_boost else 0.0)
+            b_setups[i] = "BREAKOUT_SQUEEZE" if recent_sq else "BREAKOUT"
+        elif bull_pb:
+            trig_b = 18.0 + (6.0 if close_pos >= 0.72 else 2.0) + (4.0 if vol_boost else 0.0)
+            b_setups[i] = "PULLBACK_REJECTION"
+        elif bull_mom:
+            trig_b = 16.0 + (4.0 if close_pos >= 0.70 else 0.0)
+            b_setups[i] = "MOMENTUM_SHIFT"
+
+        # Bear triggers
+        bear_brk = (c[i] < d_lo[i]) and (c[i - 1] >= d_lo[i] * 0.9995) and (close_pos <= 0.42) and (body_ratio >= 0.35)
+        pullback_zone_s = (h[i] >= e20[i] - 0.25 * atr) or (h[i - 1] >= e20[i - 1] - 0.20 * atr) or (h[i] >= vwap_a[i] - 0.2 * atr)
+        bear_pb = (
+            pullback_zone_s
+            and (c[i] < o[i])
+            and (c[i] < l[i - 1] or close_pos <= 0.38)
+            and (c[i] < e20[i])
+            and (34.0 <= rsi_a[i] <= 62.0)
+            and (rsi_a[i] < rsi_a[i - 1])
+        )
+        bear_mom = (c[i] < e20[i]) and (c[i] < vwap_a[i]) and (macd_a[i] < 0) and (macd_a[i - 1] >= 0) and (close_pos <= 0.42)
+
+        trig_s = 0.0
+        if bear_brk:
+            trig_s = 20.0 + (5.0 if recent_sq else 0.0) + (5.0 if vol_boost else 0.0)
+            s_setups[i] = "BREAKOUT_SQUEEZE" if recent_sq else "BREAKOUT"
+        elif bear_pb:
+            trig_s = 18.0 + (6.0 if close_pos <= 0.28 else 2.0) + (4.0 if vol_boost else 0.0)
+            s_setups[i] = "PULLBACK_REJECTION"
+        elif bear_mom:
+            trig_s = 16.0 + (4.0 if close_pos <= 0.30 else 0.0)
+            s_setups[i] = "MOMENTUM_SHIFT"
+
+        # ------------------------------------------------------------------
+        # 4. Hard Safety Vetoes (Anti-Exhaustion, Anti-Countertrend, Room)
+        # ------------------------------------------------------------------
+        sb = int(round(min(100.0, htf_b + ltf_b + trig_b)))
+        ss = int(round(min(100.0, htf_s + ltf_s + trig_s)))
+
+        # Must have a real trigger & not fight strong HTF counter-trend
+        if b_setups[i] == "NONE" or (rsi_a[i] > 74.0) or (vz_a[i] > 2.4) or (c[i] - e20[i] > 2.6 * atr) or h_bear:
+            sb = min(sb, 45)
+        if s_setups[i] == "NONE" or (rsi_a[i] < 26.0) or (vz_a[i] < -2.4) or (e20[i] - c[i] > 2.6 * atr) or h_bull:
+            ss = min(ss, 45)
+
+        b_scores[i] = sb
+        s_scores[i] = ss
+
+    return {
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "atr": atr_a,
+        "rsi": rsi_a,
+        "adx": adx_a,
+        "er": er_a,
+        "chop": chop_a,
+        "vz": vz_a,
+        "sw_lo": sw_l,
+        "sw_hi": sw_h,
+        "hres": hres,
+        "hsup": hsup,
+        "b_scores": b_scores,
+        "s_scores": s_scores,
+        "b_setups": b_setups,
+        "s_setups": s_setups,
+        "regimes": regimes,
+        "sess_ok": sess_ok,
+        "timestamps": np.array(ts_list, dtype=object),
+    }
+
+
+# ==============================================================================
+# 8. POSITION SIZING, BUCKET CORRELATION GUARD & TRADE LEVEL ENGINE
+# ==============================================================================
+def calc_lot_and_risk(
+    inst: str,
+    mode: str,
+    entry: float,
+    sl: float,
+    balance: float = GLOBAL["balance"],
+) -> Tuple[float, float]:
+    risk_pct = GLOBAL["risk_pct_scalping"] if mode == "scalp" else GLOBAL["risk_pct_swing"]
+    target_risk = balance * (risk_pct / 100.0)
+    dist = abs(entry - sl)
+    if dist <= EPSILON:
+        return INSTRUMENTS[inst]["contract"]["lot_min"], target_risk
+    lot_unit = float(INSTRUMENTS[inst]["contract"]["lot_unit"])
+    raw_lot = target_risk / (dist * lot_unit)
+    lot = floor_lot(inst, raw_lot)
+    actual_risk = dist * lot * lot_unit
+    return lot, round(actual_risk, 2)
+
+
+def compute_sl_tp_levels(
+    inst: str,
+    mode: str,
+    direction: str,
+    entry: float,
+    atr: float,
+    sw_lo: float,
+    sw_hi: float,
+    sl_mult: float,
+    tp2_r: float,
+) -> Dict[str, float]:
+    mcfg = INSTRUMENTS[inst][mode]
+    if direction == "BUY":
+        raw_sl = min(entry - sl_mult * atr, sw_lo - 0.25 * atr) if not np.isnan(sw_lo) else (entry - sl_mult * atr)
+        # Clamp SL distance between 0.9 ATR and 2.5 ATR
+        sl_dist = max(0.95 * atr, min(2.50 * atr, entry - raw_sl))
+        sl = round_price(inst, entry - sl_dist)
+        sl_dist = abs(entry - sl)
+        tp1 = round_price(inst, entry + mcfg["tp1_rr"] * sl_dist)
+        tp2 = round_price(inst, entry + tp2_r * sl_dist)
+        tp3 = round_price(inst, entry + (tp2_r + 0.8) * sl_dist)
+    else:
+        raw_sl = max(entry + sl_mult * atr, sw_hi + 0.25 * atr) if not np.isnan(sw_hi) else (entry + sl_mult * atr)
+        sl_dist = max(0.95 * atr, min(2.50 * atr, raw_sl - entry))
+        sl = round_price(inst, entry + sl_dist)
+        sl_dist = abs(sl - entry)
+        tp1 = round_price(inst, entry - mcfg["tp1_rr"] * sl_dist)
+        tp2 = round_price(inst, entry - tp2_r * sl_dist)
+        tp3 = round_price(inst, entry - (tp2_r + 0.8) * sl_dist)
+    return {
+        "sl": sl,
+        "sl_dist": sl_dist,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+    }
+
+
+def correlation_cap_ok(conn: sqlite3.Connection, inst: str, new_risk_usd: float) -> Tuple[bool, str]:
+    open_rows = conn.execute("SELECT inst, risk_usd FROM trades WHERE status = 'OPEN'").fetchall()
+    if len(open_rows) >= GLOBAL["max_open_trades"]:
+        return False, f"MAX_OPEN_TRADES ({len(open_rows)}/{GLOBAL['max_open_trades']})"
+
+    bucket = INSTRUMENTS[inst]["corr_bucket"]
+    bucket_risk = sum(float(r["risk_usd"]) for r in open_rows if INSTRUMENTS.get(r["inst"], {}).get("corr_bucket") == bucket)
+    max_bucket_usd = GLOBAL["balance"] * (GLOBAL["max_bucket_risk_pct"] / 100.0)
+    if bucket_risk + new_risk_usd > max_bucket_usd + 1e-6:
+        return False, f"BUCKET_RISK_CAP ({bucket}: ${bucket_risk:.2f}+${new_risk_usd:.2f} > ${max_bucket_usd:.2f})"
+    return True, "OK"
+
+
+# ==============================================================================
+# 9. STRICT WALK-FORWARD BACKTEST ENGINE (ZERO LOOKAHEAD, EXACT PARITY)
+# ==============================================================================
+def backtest_slice(
+    inst: str,
+    mode: str,
+    cache: Dict[str, np.ndarray],
+    start_idx: int,
+    end_idx: int,
+    sl_mult: float,
+    tp2_r: float,
+    min_score: int,
+    trail_mult: float = 1.4,
+) -> Dict[str, Any]:
+    cfg = INSTRUMENTS[inst]
+    mcfg = cfg[mode]
+    costs = cfg["costs"]
+    o = cache["open"]
+    h = cache["high"]
+    l = cache["low"]
+    c = cache["close"]
+    atr_a = cache["atr"]
+    sw_lo = cache["sw_lo"]
+    sw_hi = cache["sw_hi"]
+    hres = cache["hres"]
+    hsup = cache["hsup"]
+    b_scores = cache["b_scores"]
+    s_scores = cache["s_scores"]
+    b_setups = cache["b_setups"]
+    s_setups = cache["s_setups"]
+    sess_ok = cache["sess_ok"]
+
+    min_margin = int(mcfg["min_margin"])
+    max_hold = int(mcfg["max_hold_bars"])
+    lot_unit = float(cfg["contract"]["lot_unit"])
+    half_cost_px = 0.5 * float(costs["spread_px"]) + float(costs["slip_px"])
+    comm_rt = float(costs["comm_rt_per_lot"])
+    be_buf = float(GLOBAL["be_buffer_r"])
+
+    pos: Optional[Dict[str, Any]] = None
+    trades_r: List[float] = []
+    eq = 100.0
+    peak = 100.0
+    max_dd = 0.0
+    risk_pct = GLOBAL["risk_pct_scalping"] if mode == "scalp" else GLOBAL["risk_pct_swing"]
+
+    n_lim = min(end_idx, len(c) - 1)
+    for t in range(max(65, start_idx), n_lim):
+        # 1. Manage open position on bar t+1 (strictly out-of-sample bar t+1)
+        if pos is not None:
+            bar_o, bar_h, bar_l, bar_c = o[t + 1], h[t + 1], l[t + 1], c[t + 1]
+            pos["bars"] += 1
+            d = pos["dir"]
+            sl_dist = pos["sl_dist"]
+            done = False
+            exit_r = 0.0
+
+            # Conservative SL-before-TP intrabar ordering
+            if d == "BUY":
+                if bar_o <= pos["sl"] or bar_l <= pos["sl"]:
+                    fill = min(bar_o, pos["sl"])
+                    rem_r = (fill - pos["entry"]) / sl_dist
+                    exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                    done = True
+                else:
+                    if not pos["tp1_hit"] and bar_h >= pos["tp1"]:
+                        pos["tp1_hit"] = True
+                        pos["tp1_r"] = mcfg["tp1_rr"]
+                        pos["sl"] = max(pos["sl"], pos["entry"] + be_buf * sl_dist)
+                    if bar_h >= pos["tp2"]:
+                        rem_r = tp2_r
+                        exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                        done = True
+                    elif pos["tp1_hit"]:
+                        new_trail = bar_c - pos["trail_dist"]
+                        if new_trail > pos["sl"]:
+                            pos["sl"] = new_trail
+            else:
+                if bar_o >= pos["sl"] or bar_h >= pos["sl"]:
+                    fill = max(bar_o, pos["sl"])
+                    rem_r = (pos["entry"] - fill) / sl_dist
+                    exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                    done = True
+                else:
+                    if not pos["tp1_hit"] and bar_l <= pos["tp1"]:
+                        pos["tp1_hit"] = True
+                        pos["tp1_r"] = mcfg["tp1_rr"]
+                        pos["sl"] = min(pos["sl"], pos["entry"] - be_buf * sl_dist)
+                    if bar_l <= pos["tp2"]:
+                        rem_r = tp2_r
+                        exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                        done = True
+                    elif pos["tp1_hit"]:
+                        new_trail = bar_c + pos["trail_dist"]
+                        if new_trail < pos["sl"]:
+                            pos["sl"] = new_trail
+
+            if not done and pos["bars"] >= max_hold:
+                rem_r = ((bar_c - pos["entry"]) if d == "BUY" else (pos["entry"] - bar_c)) / sl_dist
+                exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                done = True
+
+            if done:
+                net_r = exit_r - pos["cost_r"]
+                trades_r.append(net_r)
+                eq *= (1.0 + (risk_pct / 100.0) * net_r)
+                peak = max(peak, eq)
+                dd = (peak - eq) / peak * 100.0
+                max_dd = max(max_dd, dd)
+                pos = None
+                continue
+
+        # 2. Evaluate signal strictly on closed bar t -> execute on t+1 open
+        if pos is None and sess_ok[t]:
+            sb, ss = int(b_scores[t]), int(s_scores[t])
+            atr = atr_a[t]
+            if atr <= EPSILON or np.isnan(atr):
+                continue
+
+            direction = None
+            if sb >= min_score and (sb - ss) >= min_margin and b_setups[t] != "NONE":
+                direction = "BUY"
+            elif ss >= min_score and (ss - sb) >= min_margin and s_setups[t] != "NONE":
+                direction = "SELL"
+
+            if direction is None:
+                continue
+
+            entry_raw = o[t + 1]
+            # Slippage + spread adverse fill
+            entry_eff = (entry_raw + half_cost_px) if direction == "BUY" else (entry_raw - half_cost_px)
+            lvls = compute_sl_tp_levels(inst, mode, direction, entry_eff, atr, sw_lo[t], sw_hi[t], sl_mult, tp2_r)
+            sl_dist = lvls["sl_dist"]
+
+            # Room-to-run check vs HTF structure
+            if direction == "BUY" and not np.isnan(hres[t]) and (hres[t] - entry_eff) < 0.75 * sl_dist:
+                continue
+            if direction == "SELL" and not np.isnan(hsup[t]) and (entry_eff - hsup[t]) < 0.75 * sl_dist:
+                continue
+
+            lot, risk_usd = calc_lot_and_risk(inst, mode, entry_eff, lvls["sl"])
+            # Realistic total cost in R: entry half_cost_px is in entry_eff; add exit half_cost_px + round-trip commission
+            cost_r = (comm_rt * lot) / max(risk_usd, 1.0) + (half_cost_px / max(sl_dist, EPSILON))
+
+            pos = {
+                "dir": direction,
+                "entry": entry_eff,
+                "sl": lvls["sl"],
+                "sl_dist": sl_dist,
+                "tp1": lvls["tp1"],
+                "tp2": lvls["tp2"],
+                "tp1_hit": False,
+                "tp1_r": 0.0,
+                "trail_dist": trail_mult * atr,
+                "bars": 0,
+                "cost_r": cost_r,
+            }
+
+    wins = [r for r in trades_r if r > 0]
+    losses = [r for r in trades_r if r <= 0]
+    gross_p = sum(wins)
+    gross_l = abs(sum(losses))
+    pf = (gross_p / gross_l) if gross_l > 0 else (3.5 if gross_p > 0 else 0.0)
+    wr = (len(wins) / len(trades_r) * 100.0) if trades_r else 0.0
+    total_r = sum(trades_r)
+    return {
+        "trades": len(trades_r),
+        "winrate": round(wr, 2),
+        "pf": round(min(pf, 9.99), 2),
+        "total_r": round(total_r, 2),
+        "max_dd": round(max_dd, 2),
+        "ret_pct": round(eq - 100.0, 2),
+        "r_list": trades_r,
+    }
+
+
+def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    sl_grid = [1.3, 1.5, 1.8]
+    tp2_grid = [2.0, 2.4, 2.8]
+    score_grid = [68, 72, 76]
+
+    for inst, cfg in INSTRUMENTS.items():
+        for mode in ("scalp", "swing"):
+            mcfg = cfg[mode]
+            key = f"{inst}_{mode}"
+            df_l, src_l = fetch_candles(inst, mcfg["ltf"], deep=True)
+            df_h, src_h = fetch_candles(inst, mcfg["htf"], deep=True)
+            if df_l is None or df_h is None or len(df_l) < 220 or len(df_h) < 70:
+                log.warning("[CALIB %s] Insufficient historical bars (%s/%s)", key, len(df_l) if df_l is not None else 0, len(df_h) if df_h is not None else 0)
+                results[key] = {"active": False, "reason": "INSUFFICIENT_DATA"}
+                continue
+
+            cache = precompute_signals(inst, mode, df_l, df_h)
+            n = len(df_l)
+            is_end = int(n * 0.65)
+            min_fold_t = GLOBAL["bt_min_fold_trades_scalp"] if mode == "scalp" else GLOBAL["bt_min_fold_trades_swing"]
+
+            best_score = -1e9
+            best_params = {"sl_mult": 1.5, "tp2_r": 2.4, "min_score": mcfg["min_score"], "trail_mult": 1.4}
+            best_is = None
+
+            for sl_m in sl_grid:
+                for tp2_m in tp2_grid:
+                    for sc_m in score_grid:
+                        res_is = backtest_slice(inst, mode, cache, 65, is_end, sl_m, tp2_m, sc_m)
+                        if res_is["trades"] < GLOBAL["bt_min_is_trades"]:
+                            continue
+                        obj = res_is["total_r"] + 2.5 * (res_is["pf"] - 1.0) - 0.6 * res_is["max_dd"]
+                        if obj > best_score:
+                            best_score = obj
+                            best_params = {"sl_mult": sl_m, "tp2_r": tp2_m, "min_score": sc_m, "trail_mult": 1.4}
+                            best_is = res_is
+
+            if best_is is None:
+                best_is = backtest_slice(inst, mode, cache, 65, is_end, 1.5, 2.4, 68)
+                best_params = {"sl_mult": 1.5, "tp2_r": 2.4, "min_score": 68, "trail_mult": 1.4}
+
+            # 3-Fold Anchored Walk-Forward OOS validation
+            oos_len = n - is_end
+            fold_size = max(50, oos_len // 3)
+            oos_folds_passed = 0
+            oos_r_all: List[float] = []
+            oos_dds: List[float] = []
+            for f_idx in range(3):
+                f_s = is_end + f_idx * fold_size
+                f_e = n if f_idx == 2 else min(n, f_s + fold_size)
+                if f_e - f_s < 40:
+                    continue
+                res_f = backtest_slice(
+                    inst, mode, cache, f_s, f_e,
+                    best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"], best_params["trail_mult"]
+                )
+                oos_r_all.extend(res_f["r_list"])
+                oos_dds.append(res_f["max_dd"])
+                if res_f["trades"] >= min_fold_t and res_f["pf"] >= 1.15 and res_f["total_r"] > 0 and res_f["max_dd"] < GLOBAL["bt_max_oos_dd_pct"]:
+                    oos_folds_passed += 1
+
+            # Combined OOS metrics
+            res_oos_full = backtest_slice(
+                inst, mode, cache, is_end, n,
+                best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"], best_params["trail_mult"]
+            )
+            active = (
+                oos_folds_passed >= 2
+                and res_oos_full["pf"] >= GLOBAL["bt_min_oos_pf"]
+                and res_oos_full["total_r"] > 0
+                and res_oos_full["max_dd"] <= GLOBAL["bt_max_oos_dd_pct"]
+            )
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO calibration_state
+                (inst, mode, active, params_json, oos_pf, oos_winrate, oos_dd, oos_trades, oos_folds_passed, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    inst, mode, 1 if active else 0, json.dumps(best_params),
+                    res_oos_full["pf"], res_oos_full["winrate"], res_oos_full["max_dd"],
+                    res_oos_full["trades"], oos_folds_passed, utc_iso(),
+                ),
+            )
+            conn.commit()
+            log.info(
+                "[CALIB %s] active=%s | params=%s | IS(t=%d, PF=%.2f, R=%.1f) | OOS(t=%d, WR=%.1f%%, PF=%.2f, DD=%.1f%%, folds=%d/3)",
+                key, active, best_params, best_is["trades"], best_is["pf"], best_is["total_r"],
+                res_oos_full["trades"], res_oos_full["winrate"], res_oos_full["pf"], res_oos_full["max_dd"], oos_folds_passed,
+            )
+            results[key] = {
+                "active": active,
+                "params": best_params,
+                "is": best_is,
+                "oos": res_oos_full,
+                "folds_passed": oos_folds_passed,
+                "src": f"{src_l}+{src_h}",
+            }
+            if chart_collector is not None:
+                chart_collector.append({
+                    "key": f"{inst} {mode.upper()}",
+                    "active": active,
+                    "r_list": res_oos_full["r_list"],
+                    "pf": res_oos_full["pf"],
+                    "wr": res_oos_full["winrate"],
+                    "dd": res_oos_full["max_dd"],
+                    "trades": res_oos_full["trades"],
+                })
+
+    set_state(conn, "last_bt_utc", utc_iso())
+    return results
+
+
+def generate_multiasset_chart(items: List[Dict[str, Any]], out_path: str = CHART_PATH) -> Optional[str]:
+    if not items:
+        return None
+    try:
+        plt.style.use("dark_background")
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8), gridspec_kw={"height_ratios": [2.4, 1.0]})
+        fig.patch.set_facecolor("#0b0f17")
+        ax1.set_facecolor("#111827")
+        ax2.set_facecolor("#111827")
+
+        palette = ["#22c55e", "#38bdf8", "#f59e0b", "#a78bfa", "#fb7185", "#14b8a6", "#eab308", "#60a5fa"]
+        for idx, it in enumerate(items):
+            rs = it["r_list"]
+            if not rs:
+                continue
+            cum_r = np.cumsum([0.0] + rs)
+            col = palette[idx % len(palette)]
+            status_tag = "ON" if it["active"] else "OFF"
+            lbl = f"{it['key']} [{status_tag}] PF:{it['pf']:.2f} WR:{it['wr']:.0f}% T:{it['trades']}"
+            ax1.plot(cum_r, label=lbl, color=col, linewidth=1.9, alpha=0.92)
+
+        ax1.axhline(0.0, color="#64748b", linestyle="--", linewidth=0.9)
+        ax1.set_title(f"QUANT BOT v{BOT_VERSION} — Out-of-Sample Walk-Forward Cumulative Expectancy (R)", fontsize=13, fontweight="bold", color="#f8fafc", pad=12)
+        ax1.set_ylabel("Cumulative R-Multiple", color="#cbd5e1")
+        ax1.grid(True, alpha=0.18, linestyle="--")
+        ax1.legend(loc="upper left", fontsize=8.5, ncol=2, frameon=True, facecolor="#0f172a", edgecolor="#334155")
+
+        names = [it["key"] for it in items]
+        pfs = [min(it["pf"], 4.0) for it in items]
+        colors = ["#22c55e" if it["active"] else "#64748b" for it in items]
+        bars = ax2.bar(names, pfs, color=colors, alpha=0.85, edgecolor="#1e293b")
+        ax2.axhline(GLOBAL["bt_min_oos_pf"], color="#f59e0b", linestyle="--", linewidth=1.1, label=f"Min OOS PF ({GLOBAL['bt_min_oos_pf']})")
+        ax2.set_ylabel("OOS Profit Factor", color="#cbd5e1")
+        ax2.tick_params(axis="x", rotation=22, labelsize=8.5)
+        ax2.grid(True, axis="y", alpha=0.18, linestyle="--")
+        ax2.legend(loc="upper right", fontsize=8.5)
+        for b, pf_v in zip(bars, pfs):
+            ax2.text(b.get_x() + b.get_width() / 2.0, pf_v + 0.06, f"{pf_v:.2f}", ha="center", va="bottom", fontsize=8, color="#e2e8f0")
+
+        plt.tight_layout()
+        fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return out_path
+    except Exception as exc:
+        log.warning("Chart generation failed: %s", exc)
+        return None
+
+
+# ==============================================================================
+# 10. LIVE EVALUATION, MONITOR OPEN TRADES & TELEGRAM /check COMMAND
+# ==============================================================================
+def get_calibration(conn: sqlite3.Connection, inst: str, mode: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute("SELECT * FROM calibration_state WHERE inst = ? AND mode = ?", (inst, mode)).fetchone()
+    if not row:
+        return None
+    return {
+        "active": bool(row["active"]),
+        "params": json.loads(row["params_json"]),
+        "oos_pf": float(row["oos_pf"]),
+        "oos_winrate": float(row["oos_winrate"]),
+        "oos_dd": float(row["oos_dd"]),
+        "oos_trades": int(row["oos_trades"]),
+        "oos_folds": int(row["oos_folds_passed"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def evaluate_live_instrument(
+    conn: sqlite3.Connection,
+    inst: str,
+    mode: str,
+) -> Dict[str, Any]:
+    cfg = INSTRUMENTS[inst]
+    mcfg = cfg[mode]
+    is_open, mkt_reason = is_market_open(inst)
+    if not is_open:
+        return {"status": "SKIP", "reason": mkt_reason}
+
+    cal = get_calibration(conn, inst, mode)
+    if cal is None or not cal["active"]:
+        return {"status": "SKIP", "reason": f"CALIB_GATE_OFF ({cal['oos_pf'] if cal else 'NONE'})"}
+
+    df_l, src_l = fetch_candles(inst, mcfg["ltf"], deep=False)
+    df_h, src_h = fetch_candles(inst, mcfg["htf"], deep=False)
+    if df_l is None or df_h is None or len(df_l) < mcfg["ltf_min"] or len(df_h) < mcfg["htf_min"]:
+        return {"status": "SKIP", "reason": f"LOW_BARS ({src_l}/{src_h})"}
+
+    fresh_l, age_l = check_candle_freshness(inst, mcfg["ltf"], df_l, mcfg["stale_min"])
+    if not fresh_l:
+        return {"status": "SKIP", "reason": f"STALE_LTF ({age_l:.1f}m > {mcfg['stale_min']}m)"}
+
+    cache = precompute_signals(inst, mode, df_l, df_h)
+    idx = len(df_l) - 1
+    candle_ts = df_l["timestamp"].iloc[idx].strftime("%Y-%m-%dT%H:%M:%SZ")
+    bar_close = float(cache["close"][idx])
+    atr = float(cache["atr"][idx])
+    sb = int(cache["b_scores"][idx])
+    ss = int(cache["s_scores"][idx])
+    regime = str(cache["regimes"][idx])
+
+    micro = fetch_live_microstructure(inst, bar_close)
+    live_px = float(micro["price"])
+    spread = float(micro["spread"])
+
+    if not bool(cache["sess_ok"][idx]):
+        return {"status": "NO_SIGNAL", "reason": "OUTSIDE_SCALP_SESSION", "bull": sb, "bear": ss, "regime": regime, "live_px": live_px}
+
+    if atr > 0 and (spread / atr) > cfg["costs"]["max_spread_atr"]:
+        return {"status": "SKIP", "reason": f"WIDE_SPREAD ({spread:.2f}/{atr:.2f})"}
+
+    if micro["cross_div_pct"] > cfg["costs"]["max_exch_div_pct"]:
+        return {"status": "SKIP", "reason": f"CROSS_VENUE_DIV ({micro['cross_div_pct']:.2f}%)"}
+
+    params = cal["params"]
+    min_score = int(params["min_score"])
+    min_margin = int(mcfg["min_margin"])
+
+    direction = None
+    setup = "NONE"
+    score = max(sb, ss)
+    if sb >= min_score and (sb - ss) >= min_margin and cache["b_setups"][idx] != "NONE":
+        direction = "BUY"
+        setup = str(cache["b_setups"][idx])
+        score = sb
+    elif ss >= min_score and (ss - sb) >= min_margin and cache["s_setups"][idx] != "NONE":
+        direction = "SELL"
+        setup = str(cache["s_setups"][idx])
+        score = ss
+
+    if direction is None:
+        return {"status": "NO_SIGNAL", "reason": "BELOW_THRESHOLD", "bull": sb, "bear": ss, "regime": regime, "live_px": live_px, "src": src_l}
+
+    # Valid entry zone guard vs bar close
+    dev_atr = abs(live_px - bar_close) / max(atr, EPSILON)
+    if dev_atr > mcfg["max_entry_dev_atr"]:
+        return {"status": "SKIP", "reason": f"PRICE_MOVED_BEYOND_ENTRY_ZONE ({dev_atr:.2f} ATR)"}
+
+    # Cooldown & Anti-Flip-Flop
+    cd_min = GLOBAL["scalp_cooldown_min"] if mode == "scalp" else GLOBAL["swing_cooldown_min"]
+    flip_min = GLOBAL["anti_flip_scalp_min"] if mode == "scalp" else GLOBAL["anti_flip_swing_min"]
+    last_trade = conn.execute(
+        "SELECT direction, opened_at, candle_ts FROM trades WHERE inst = ? AND mode = ? ORDER BY id DESC LIMIT 1",
+        (inst, mode),
+    ).fetchone()
+    if last_trade:
+        if last_trade["candle_ts"] == candle_ts:
+            return {"status": "SKIP", "reason": "DUPLICATE_CANDLE"}
+        elapsed_min = (utc_now() - datetime.fromisoformat(last_trade["opened_at"].replace("Z", "+00:00"))).total_seconds() / 60.0
+        if elapsed_min < cd_min:
+            return {"status": "SKIP", "reason": f"COOLDOWN ({elapsed_min:.0f}m/{cd_min}m)"}
+        if last_trade["direction"] != direction and elapsed_min < flip_min:
+            return {"status": "SKIP", "reason": f"ANTI_FLIPFLOP ({elapsed_min:.0f}m/{flip_min}m)"}
+
+    # Structural SL/TP calculated at live executable price
+    lvls = compute_sl_tp_levels(
+        inst, mode, direction, live_px, atr,
+        float(cache["sw_lo"][idx]), float(cache["sw_hi"][idx]),
+        float(params["sl_mult"]), float(params["tp2_r"]),
+    )
+    hres, hsup = float(cache["hres"][idx]), float(cache["hsup"][idx])
+    if direction == "BUY" and not np.isnan(hres) and (hres - live_px) < 0.75 * lvls["sl_dist"]:
+        return {"status": "SKIP", "reason": "NO_ROOM_TO_RESISTANCE"}
+    if direction == "SELL" and not np.isnan(hsup) and (live_px - hsup) < 0.75 * lvls["sl_dist"]:
+        return {"status": "SKIP", "reason": "NO_ROOM_TO_SUPPORT"}
+
+    lot, risk_usd = calc_lot_and_risk(inst, mode, live_px, lvls["sl"])
+    cap_ok, cap_reason = correlation_cap_ok(conn, inst, risk_usd)
+    if not cap_ok:
+        return {"status": "SKIP", "reason": cap_reason}
+
+    valid_min = round_price(inst, bar_close - mcfg["max_entry_dev_atr"] * atr)
+    valid_max = round_price(inst, bar_close + mcfg["max_entry_dev_atr"] * atr)
+
+    return {
+        "status": "SIGNAL",
+        "inst": inst,
+        "mode": mode,
+        "direction": direction,
+        "setup": setup,
+        "score": score,
+        "bull": sb,
+        "bear": ss,
+        "regime": regime,
+        "candle_ts": candle_ts,
+        "entry": round_price(inst, live_px),
+        "valid_min": valid_min,
+        "valid_max": valid_max,
+        "sl": lvls["sl"],
+        "tp1": lvls["tp1"],
+        "tp2": lvls["tp2"],
+        "tp3": lvls["tp3"],
+        "sl_dist": lvls["sl_dist"],
+        "trail_atr": float(params["trail_mult"]) * atr,
+        "lot": lot,
+        "risk_usd": risk_usd,
+        "atr": atr,
+        "spread": spread,
+        "src_l": src_l,
+        "micro_src": micro["source"],
+        "cal": cal,
+    }
+
+
+def format_signal_html(sig: Dict[str, Any]) -> str:
+    inst = sig["inst"]
+    d_emoji = "🟢 BUY / LONG" if sig["direction"] == "BUY" else "🔴 SELL / SHORT"
+    m_tag = "⚡ SCALPING" if sig["mode"] == "scalp" else "🌊 SWING"
+    risk_pct = GLOBAL["risk_pct_scalping"] if sig["mode"] == "scalp" else GLOBAL["risk_pct_swing"]
+    cal = sig["cal"]
     return (
-        f"{badge} <b>{_esc(sig['instrument'])} | {_esc(sig['mode'])} | {_esc(sig['direction'])}</b>\n"
-        f"Setup: <code>{_esc(sig['setup'])}</code> ({_esc(sig['regime'])}) | Skor: <code>{sig['score']}/100</code>\n"
-        f"Entry: <code>{sig['entry']:.2f}</code> | SL: <code>{sig['sl']:.2f}</code>\n"
-        f"TP1 (50%): <code>{sig['tp1']:.2f}</code> | TP2: <code>{sig['tp2']:.2f}</code> | TP3: <code>{sig['tp3']:.2f}</code>\n"
-        f"Lot: <code>{sig['lot']:.2f}</code>{warn_txt} (${sig['risk_usd']:.0f}) | "
-        f"ADX {sig['adx']:.1f} | RSI {sig['rsi']:.0f} | <code>{_esc(sig['bar_ts'][11:16])} UTC</code>"
+        f"🎯 <b>{html.escape(inst)} — {d_emoji}</b> ({m_tag})\n"
+        f"📊 Setup: <code>{html.escape(sig['setup'])}</code> | Regime: <code>{html.escape(sig['regime'])}</code>\n"
+        f"🔥 Conviction: <b>{sig['score']}/100</b> (Bull {sig['bull']} / Bear {sig['bear']})\n"
+        f"────────────────────\n"
+        f"💵 <b>Entry Live:</b> <code>{fmt_price(inst, sig['entry'])}</code>\n"
+        f"📌 Valid Zone: <code>{fmt_price(inst, sig['valid_min'])} – {fmt_price(inst, sig['valid_max'])}</code>\n"
+        f"🛑 <b>Stop Loss:</b> <code>{fmt_price(inst, sig['sl'])}</code>\n"
+        f"🎯 <b>TP1 (50% + BE +{GLOBAL['be_buffer_r']:.2f}R):</b> <code>{fmt_price(inst, sig['tp1'])}</code>\n"
+        f"🎯 <b>TP2 (Trail Exit):</b> <code>{fmt_price(inst, sig['tp2'])}</code>\n"
+        f"🚀 <b>TP3 (Extended):</b> <code>{fmt_price(inst, sig['tp3'])}</code>\n"
+        f"────────────────────\n"
+        f"📦 <b>Lot:</b> <code>{sig['lot']:.2f}</code> | Risk: <code>${sig['risk_usd']:.2f} ({risk_pct:.2f}%)</code>\n"
+        f"🧪 OOS Gate: <code>PF {cal['oos_pf']:.2f} | WR {cal['oos_winrate']:.1f}% | DD {cal['oos_dd']:.1f}%</code>\n"
+        f"📡 Feed: <code>{html.escape(sig['src_l'])} / {html.escape(sig['micro_src'])}</code> | Spread: <code>{sig['spread']:.2f}</code>\n"
+        f"🕒 Candle UTC: <code>{sig['candle_ts']}</code>"
     )
 
+
+def save_and_broadcast_signal(conn: sqlite3.Connection, sig: Dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT INTO trades
+        (inst, mode, direction, status, candle_ts, opened_at, entry, sl, orig_sl, tp1, tp2, tp3,
+         lot, risk_usd, tp1_hit, trail_atr, best_sl, bars_held, score, regime)
+        VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?)
+        """,
+        (
+            sig["inst"], sig["mode"], sig["direction"], sig["candle_ts"], utc_iso(),
+            sig["entry"], sig["sl"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"],
+            sig["lot"], sig["risk_usd"], sig["trail_atr"], sig["sl"], sig["score"], sig["regime"],
+        ),
+    )
+    conn.commit()
+    msg = format_signal_html(sig)
+    notify_all(msg)
+    audit_log(conn, "SIGNAL_EMITTED", sig["inst"], sig["mode"], sig["direction"], {
+        "entry": sig["entry"], "sl": sig["sl"], "tp1": sig["tp1"], "tp2": sig["tp2"],
+        "lot": sig["lot"], "score": sig["score"], "regime": sig["regime"],
+    })
+
+
 def monitor_open_trades(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        "SELECT id, opened_ts, instrument, mode, direction, entry, initial_sl, sl, tp1, tp2, tp3, "
-        "be_active, COALESCE(tp1_hit, 0), trail_dist, last_bar_ts, bars_held, source "
-        "FROM open_trades WHERE status='OPEN'"
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY id ASC").fetchall()
+    if not rows:
+        return
 
-    for (tid, opened_ts, inst, mode, direction, entry, initial_sl, sl, tp1, tp2, tp3,
-         be_active, tp1_hit_val, trail_dist, last_bar_ts, bars_held, src_locked) in rows:
-        if not market_open(inst, for_monitoring=True):
-            continue
-        _, df_ent, _ = fetch_pair_locked(inst, mode, preferred_source=src_locked)
-        if df_ent is None or df_ent.empty:
-            continue
+    be_buf = float(GLOBAL["be_buffer_r"])
+    for r in rows:
+        inst = r["inst"]
+        mode = r["mode"]
+        direction = r["direction"]
+        entry = float(r["entry"])
+        orig_sl = float(r["orig_sl"])
+        cur_sl = float(r["best_sl"])
+        tp1 = float(r["tp1"])
+        tp2 = float(r["tp2"])
+        sl_dist = max(abs(entry - orig_sl), EPSILON)
+        tp1_hit = bool(r["tp1_hit"])
+        trail_atr = float(r["trail_atr"])
+        risk_usd = float(r["risk_usd"])
+        opened_dt = datetime.fromisoformat(r["opened_at"].replace("Z", "+00:00"))
+        ltf = INSTRUMENTS[inst][mode]["ltf"]
 
-        tf = TIMEFRAMES[mode]
-        ent_open_sec = _to_epoch_sec(df_ent.index)
-        if last_bar_ts:
-            fresh = df_ent[ent_open_sec > _parse_ts(last_bar_ts).timestamp() + 1.0]
-        else:
-            fresh = df_ent[(ent_open_sec + tf["entry_sec"]) > _parse_ts(opened_ts).timestamp()]
-        if fresh.empty:
-            continue
+        micro = fetch_live_microstructure(inst, entry)
+        live_px = float(micro["price"])
 
-        orig_risk = max(abs(float(entry) - float(initial_sl)), 1e-9)
-        t_dist    = float(trail_dist) if trail_dist and float(trail_dist) > 0 else orig_risk * (tf["trail_atr"] / tf["sl_atr"])
-        be_trig   = float(tf["be_trigger_r"]) * orig_risk
-        active_sl = float(sl)
-        be_on     = int(be_active or 0)
-        tp1_hit   = int(tp1_hit_val or 0)
-        held      = int(bars_held or 0)
-        max_hold  = int(tf["max_hold_bars"])
+        # Inspect closed candles since trade opened to catch intrabar wick hits
+        df_l, _ = fetch_candles(inst, ltf, deep=False)
+        bars_to_check: List[Tuple[float, float, float]] = []
+        bars_held = int(r["bars_held"])
+        if df_l is not None and not df_l.empty:
+            bar_close_ts = df_l["timestamp"] + pd.to_timedelta(TF_SECONDS[ltf], unit="s")
+            sub = df_l[bar_close_ts > opened_dt]
+            bars_held = len(sub)
+            for _, row_b in sub.tail(10).iterrows():
+                bars_to_check.append((float(row_b["high"]), float(row_b["low"]), float(row_b["close"])))
+        bars_to_check.append((live_px, live_px, live_px))
 
-        def calc_r(px: float) -> float:
-            tail_r = ((px - entry) if direction == "BUY" else (entry - px)) / orig_risk
-            return round((0.5 * tf["tp1_r"] + 0.5 * tail_r) if tp1_hit else tail_r, 2)
+        closed = False
+        exit_px = live_px
+        exit_reason = ""
+        tp1_just_hit = False
 
-        for bar_idx, bar in fresh.iterrows():
-            bar_iso = bar_idx.strftime("%Y-%m-%dT%H:%M:%SZ")
-            op, hi, lo, cl = float(bar["Open"]), float(bar["High"]), float(bar["Low"]), float(bar["Close"])
-            held += 1
-
+        for bh, bl, bc in bars_to_check:
             if direction == "BUY":
-                if op <= active_sl or lo <= active_sl:
-                    ex = op if op <= active_sl else active_sl
-                    r_res = calc_r(ex)
-                    status = "CLOSED_TRAIL" if (be_on or tp1_hit) else "CLOSED_SL"
-                    conn.execute(
-                        "UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                        (status, now_utc_iso(), ex, r_res, bar_iso, held, tid),
-                    )
-                    conn.commit()
-                    _notify_all(f"🛑 <b>{_esc(inst)} {_esc(mode)} BUY</b> {status} @ <code>{ex:.2f}</code> ({r_res:+.2f}R)")
+                if bl <= cur_sl:
+                    closed = True
+                    exit_px = cur_sl
+                    exit_reason = "BE/TRAIL_SL" if tp1_hit else "STOP_LOSS"
                     break
-                if not tp1_hit and hi >= tp1:
-                    tp1_hit, be_on = 1, 1
-                    active_sl = max(active_sl, entry + 0.08 * orig_risk)
-                    conn.execute(
-                        "UPDATE open_trades SET tp1_hit=1, be_active=1, sl=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                        (round(active_sl, 4), bar_iso, held, tid),
-                    )
-                    conn.commit()
-                    _notify_all(f"✅ <b>{_esc(inst)} {_esc(mode)} BUY</b> TP1 50% @ <code>{tp1:.2f}</code> | BE+ locked (SL <code>{active_sl:.2f}</code>)")
-                if hi >= tp2:
-                    r_res = calc_r(tp2)
-                    conn.execute(
-                        "UPDATE open_trades SET status='CLOSED_TP2', closed_ts=?, exit_price=?, r_result=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                        (now_utc_iso(), tp2, r_res, bar_iso, held, tid),
-                    )
-                    conn.commit()
-                    _notify_all(f"🎯 <b>{_esc(inst)} {_esc(mode)} BUY</b> TP2 @ <code>{tp2:.2f}</code> ({r_res:+.2f}R)")
+                if not tp1_hit and bh >= tp1:
+                    tp1_hit = True
+                    tp1_just_hit = True
+                    cur_sl = max(cur_sl, round_price(inst, entry + be_buf * sl_dist))
+                if bh >= tp2:
+                    closed = True
+                    exit_px = tp2
+                    exit_reason = "TAKE_PROFIT_2"
                     break
-                if (hi - entry) >= be_trig:
-                    new_sl = max(active_sl, entry + 0.08 * orig_risk, hi - t_dist)
-                    if new_sl > active_sl:
-                        active_sl, be_on = new_sl, 1
-                        conn.execute("UPDATE open_trades SET be_active=1, sl=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                                     (round(active_sl, 4), bar_iso, held, tid))
-                        conn.commit()
+                if tp1_hit and trail_atr > 0:
+                    cand = round_price(inst, bc - trail_atr)
+                    if cand > cur_sl:
+                        cur_sl = cand
             else:
-                if op >= active_sl or hi >= active_sl:
-                    ex = op if op >= active_sl else active_sl
-                    r_res = calc_r(ex)
-                    status = "CLOSED_TRAIL" if (be_on or tp1_hit) else "CLOSED_SL"
-                    conn.execute(
-                        "UPDATE open_trades SET status=?, closed_ts=?, exit_price=?, r_result=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                        (status, now_utc_iso(), ex, r_res, bar_iso, held, tid),
-                    )
-                    conn.commit()
-                    _notify_all(f"🛑 <b>{_esc(inst)} {_esc(mode)} SELL</b> {status} @ <code>{ex:.2f}</code> ({r_res:+.2f}R)")
+                if bh >= cur_sl:
+                    closed = True
+                    exit_px = cur_sl
+                    exit_reason = "BE/TRAIL_SL" if tp1_hit else "STOP_LOSS"
                     break
-                if not tp1_hit and lo <= tp1:
-                    tp1_hit, be_on = 1, 1
-                    active_sl = min(active_sl, entry - 0.08 * orig_risk)
-                    conn.execute(
-                        "UPDATE open_trades SET tp1_hit=1, be_active=1, sl=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                        (round(active_sl, 4), bar_iso, held, tid),
-                    )
-                    conn.commit()
-                    _notify_all(f"✅ <b>{_esc(inst)} {_esc(mode)} SELL</b> TP1 50% @ <code>{tp1:.2f}</code> | BE+ locked (SL <code>{active_sl:.2f}</code>)")
-                if lo <= tp2:
-                    r_res = calc_r(tp2)
-                    conn.execute(
-                        "UPDATE open_trades SET status='CLOSED_TP2', closed_ts=?, exit_price=?, r_result=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                        (now_utc_iso(), tp2, r_res, bar_iso, held, tid),
-                    )
-                    conn.commit()
-                    _notify_all(f"🎯 <b>{_esc(inst)} {_esc(mode)} SELL</b> TP2 @ <code>{tp2:.2f}</code> ({r_res:+.2f}R)")
+                if not tp1_hit and bl <= tp1:
+                    tp1_hit = True
+                    tp1_just_hit = True
+                    cur_sl = min(cur_sl, round_price(inst, entry - be_buf * sl_dist))
+                if bl <= tp2:
+                    closed = True
+                    exit_px = tp2
+                    exit_reason = "TAKE_PROFIT_2"
                     break
-                if (entry - lo) >= be_trig:
-                    new_sl = min(active_sl, entry - 0.08 * orig_risk, lo + t_dist)
-                    if new_sl < active_sl:
-                        active_sl, be_on = new_sl, 1
-                        conn.execute("UPDATE open_trades SET be_active=1, sl=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                                     (round(active_sl, 4), bar_iso, held, tid))
-                        conn.commit()
+                if tp1_hit and trail_atr > 0:
+                    cand = round_price(inst, bc + trail_atr)
+                    if cand < cur_sl:
+                        cur_sl = cand
 
-            if held >= max_hold:
-                r_res = calc_r(cl)
-                conn.execute(
-                    "UPDATE open_trades SET status='CLOSED_TIMEOUT', closed_ts=?, exit_price=?, r_result=?, last_bar_ts=?, bars_held=? WHERE id=?",
-                    (now_utc_iso(), cl, r_res, bar_iso, held, tid),
-                )
-                conn.commit()
-                _notify_all(f"⏱️ <b>{_esc(inst)} {_esc(mode)} {direction}</b> TIMEOUT @ <code>{cl:.2f}</code> ({r_res:+.2f}R)")
-                break
+        max_hold = INSTRUMENTS[inst][mode]["max_hold_bars"]
+        if not closed and bars_held >= max_hold:
+            closed = True
+            exit_px = live_px
+            exit_reason = "TIME_STOP"
 
-            conn.execute("UPDATE open_trades SET last_bar_ts=?, bars_held=? WHERE id=?", (bar_iso, held, tid))
+        if closed:
+            rem_r = ((exit_px - entry) if direction == "BUY" else (entry - exit_px)) / sl_dist
+            tp1_rr = INSTRUMENTS[inst][mode]["tp1_rr"]
+            net_r = (0.5 * tp1_rr + 0.5 * rem_r) if tp1_hit else rem_r
+            pnl_usd = round(net_r * risk_usd, 2)
+            conn.execute(
+                """
+                UPDATE trades SET status='CLOSED', closed_at=?, exit_price=?, exit_reason=?,
+                pnl_r=?, pnl_usd=?, tp1_hit=?, best_sl=?, bars_held=? WHERE id=?
+                """,
+                (utc_iso(), exit_px, exit_reason, round(net_r, 3), pnl_usd, 1 if tp1_hit else 0, cur_sl, bars_held, r["id"]),
+            )
             conn.commit()
-
-def correlation_cap_ok(conn: sqlite3.Connection, inst: str) -> bool:
-    bucket = INSTRUMENTS[inst]["corr_bucket"]
-    same_bucket = [k for k, v in INSTRUMENTS.items() if v["corr_bucket"] == bucket]
-    placeholders = ",".join("?" for _ in same_bucket)
-    open_rows = conn.execute(
-        f"SELECT COALESCE(SUM(risk_usd), 0) FROM open_trades WHERE status='OPEN' AND instrument IN ({placeholders})",
-        tuple(same_bucket),
-    ).fetchone()
-    open_risk_usd = float(open_rows[0] or 0.0)
-    max_bucket_usd = float(ACCOUNT["balance"]) * (float(ACCOUNT["max_corr_bucket_risk"]) / 100.0)
-    return open_risk_usd < max_bucket_usd
-
-def cooldown_ok(conn: sqlite3.Connection, inst: str, mode: str, direction: str, bar_ts: str) -> bool:
-    if conn.execute("SELECT COUNT(*) FROM open_trades WHERE instrument=? AND mode=? AND status='OPEN'", (inst, mode)).fetchone()[0] > 0:
-        return False
-    if conn.execute("SELECT COUNT(*) FROM signals WHERE instrument=? AND mode=? AND bar_ts=?", (inst, mode, bar_ts)).fetchone()[0] > 0:
-        return False
-    if not correlation_cap_ok(conn, inst):
-        logging.info(f"[corr-cap] skip {inst} {mode}: correlation bucket exposure reached")
-        return False
-    row = conn.execute("SELECT direction, last_ts, last_bar_ts FROM cooldown WHERE instrument=? AND mode=?", (inst, mode)).fetchone()
-    if not row:
-        return True
-    last_dir, last_ts, last_bar = row
-    if last_bar and last_bar == bar_ts:
-        return False
-    tf = TIMEFRAMES[mode]
-    age_min = (now_utc() - _parse_ts(last_ts)).total_seconds() / 60.0
-    return age_min >= (tf["cooldown_same_min"] if last_dir == direction else tf["cooldown_flip_min"])
-
-def run_live(conn: sqlite3.Connection) -> None:
-    monitor_open_trades(conn)
-    calibrated = load_calibrated_params()
-    for inst in INSTRUMENTS:
-        for mode in ("SCALPING", "SWING"):
-            if not market_open(inst, for_monitoring=False, mode=mode):
-                continue
-            try:
-                sig = evaluate_signal(inst, mode, calibrated)
-            except Exception as e:
-                logging.exception(f"[eval] {inst} {mode}: {e}")
-                continue
-            if sig is None or not cooldown_ok(conn, inst, mode, sig["direction"], sig["bar_ts"]):
-                continue
-            msg = format_signal_message(sig)
-            with conn:
-                cur = conn.execute(
-                    "INSERT INTO signals(ts,bar_ts,instrument,mode,direction,entry,sl,tp1,tp2,tp3,lot,risk_usd,score,setup,regime,source,message,notified) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                    (sig["ts"], sig["bar_ts"], inst, mode, sig["direction"], sig["entry"], sig["sl"],
-                     sig["tp1"], sig["tp2"], sig["tp3"], sig["lot"], sig["risk_usd"], sig["score"],
-                     sig["setup"], sig["regime"], sig["source"], msg),
-                )
-                sig_id = cur.lastrowid
-                conn.execute(
-                    "INSERT INTO open_trades(opened_ts,instrument,mode,direction,entry,initial_sl,sl,tp1,tp2,tp3,lot,risk_usd,trail_dist,last_bar_ts,bars_held,source) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
-                    (sig["ts"], inst, mode, sig["direction"], sig["entry"], sig["sl"], sig["sl"],
-                     sig["tp1"], sig["tp2"], sig["tp3"], sig["lot"], sig["risk_usd"], sig["trail_dist"],
-                     sig["bar_ts"], sig["source"]),
-                )
-                conn.execute(
-                    "INSERT INTO cooldown(instrument,mode,direction,last_ts,last_bar_ts) VALUES(?,?,?,?,?) "
-                    "ON CONFLICT(instrument,mode) DO UPDATE SET direction=excluded.direction, last_ts=excluded.last_ts, last_bar_ts=excluded.last_bar_ts",
-                    (inst, mode, sig["direction"], sig["ts"], sig["bar_ts"]),
-                )
-            tg_ok, dc_ok = _notify_all(msg)
-            if tg_ok or dc_ok:
-                conn.execute("UPDATE signals SET notified=1 WHERE id=?", (sig_id,))
-                conn.commit()
-
-# ==============================================================================
-# 3-FOLD ANCHORED WALK-FORWARD + MONTE CARLO CALIBRATION
-# ==============================================================================
-def run_calibration(mode: str = "SWING", plot_chart: bool = True) -> None:
-    calibrated = load_calibrated_params()
-    curves: Dict[str, List[float]] = {}
-    summary_lines: List[str] = []
-    tf = TIMEFRAMES[mode]
-    sl_grid = (1.6, 1.9, 2.2) if mode == "SCALPING" else (2.0, 2.3, 2.6)
-    tp_grid = (2.6, 3.2, 3.8) if mode == "SCALPING" else (3.5, 4.2, 5.0)
-
-    for inst in INSTRUMENTS:
-        df_htf, df_ent, src = fetch_pair_locked(inst, mode, history=True)
-        if df_htf is None or df_ent is None or len(df_ent) < 400:
-            logging.info(f"[cal-skip] {inst} {mode} insufficient history")
-            continue
-        df_htf, df_ent = compute_indicators(df_htf), compute_indicators(df_ent)
-        htf_a, ent_a = extract_arrays(df_htf), extract_arrays(df_ent)
-        htf_sh, htf_sl = extract_causal_swings(df_htf, lookback=5)
-
-        htf_close_ts = _to_epoch_sec(df_htf.index) + tf["htf_sec"]
-        ent_open_ts  = _to_epoch_sec(df_ent.index)
-        ent_close_ts = ent_open_ts + tf["entry_sec"]
-        ent_dts      = [ts.to_pydatetime() for ts in df_ent.index]
-        n_ent = len(df_ent)
-        usable = n_ent - 80
-        folds = [
-            (80 + int(usable * 0.45), 80 + int(usable * 0.63)),
-            (80 + int(usable * 0.63), 80 + int(usable * 0.81)),
-            (80 + int(usable * 0.81), n_ent),
-        ]
-
-        sig_caches = {
-            th: precompute_signals_for_threshold(htf_a, htf_sh, htf_sl, htf_close_ts, ent_a, ent_close_ts, ent_dts, inst, mode, th)
-            for th in (66, 70, 74)
-        }
-
-        oos_passes = 0
-        latest_pick = (70, tf["sl_atr"], tf["tp_atr"][1])
-        for is_end, oos_end in folds:
-            best_is = None
-            for th, sc in sig_caches.items():
-                for slm in sl_grid:
-                    for tpm in tp_grid:
-                        if tpm <= slm * 1.25:
-                            continue
-                        is_r = backtest_mtf_fast(ent_a, ent_open_ts, sc, inst, mode, slm, tpm, min_trades=6, start_idx=80, end_idx=is_end)
-                        if best_is is None or is_r["score"] > best_is[0]:
-                            best_is = (is_r["score"], th, slm, tpm)
-            if best_is is None:
-                continue
-            _, th, slm, tpm = best_is
-            latest_pick = (th, slm, tpm)
-            oos_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=3, start_idx=is_end, end_idx=oos_end)
-            if oos_r["trades"] >= 3 and oos_r["profit_factor"] >= 1.0 and oos_r["max_dd"] <= 0.25:
-                oos_passes += 1
-
-        th, slm, tpm = latest_pick
-        full_r = backtest_mtf_fast(ent_a, ent_open_ts, sig_caches[th], inst, mode, slm, tpm, min_trades=10, start_idx=80, end_idx=n_ent)
-        mc_prob = monte_carlo_prob_profit(full_r["trades_r"], runs=int(GLOBAL["mc_runs"]), risk_frac=float(GLOBAL["bt_risk_pct"]))
-        enabled = (oos_passes >= 2) and (full_r["profit_factor"] >= float(GLOBAL["bt_min_profit_factor"])) and (mc_prob >= float(GLOBAL["mc_min_prob_profit"]))
-
-        calibrated[f"{inst}:{mode}"] = {
-            "enabled": enabled,
-            "reason": "passed_3fold_wf_and_mc" if enabled else f"failed_wf(folds={oos_passes}/3,pf={full_r['profit_factor']:.2f},mc={mc_prob:.0%})",
-            "sl_mult": slm, "tp_mult": tpm, "trail_mult": tf["trail_atr"], "threshold": th,
-            "full_pf": round(full_r["profit_factor"], 2), "sqn": round(full_r["sqn"], 2),
-            "mc_prob": round(mc_prob, 3), "folds_passed": oos_passes,
-            "updated_at": now_utc_iso(),
-        }
-        if enabled:
-            curves[inst] = full_r["equity_curve"]
-            summary_lines.append(
-                f"• <b>{inst}</b> ✅ {oos_passes}/3 folds | PF <code>{full_r['profit_factor']:.2f}</code> | SQN <code>{full_r['sqn']:.2f}</code> | MC <code>{mc_prob:.0%}</code>"
+            emoji = "✅" if net_r >= 0 else "❌"
+            notify_all(
+                f"{emoji} <b>TRADE CLOSED: {inst} ({mode.upper()} {direction})</b>\n"
+                f"📌 Reason: <code>{exit_reason}</code> | Exit: <code>{fmt_price(inst, exit_px)}</code>\n"
+                f"💰 Result: <code>{net_r:+.2f}R (${pnl_usd:+.2f})</code>"
             )
         else:
-            summary_lines.append(
-                f"• <b>{inst}</b> ⛔ off ({oos_passes}/3 folds, PF {full_r['profit_factor']:.2f}, MC {mc_prob:.0%})"
+            conn.execute(
+                "UPDATE trades SET tp1_hit=?, best_sl=?, bars_held=? WHERE id=?",
+                (1 if tp1_hit else 0, cur_sl, bars_held, r["id"]),
             )
+            conn.commit()
+            if tp1_just_hit:
+                notify_all(
+                    f"🎯 <b>TP1 HIT: {inst} ({mode.upper()} {direction})</b>\n"
+                    f"🔒 50% Profit Locked | SL moved to BE+: <code>{fmt_price(inst, cur_sl)}</code>"
+                )
 
-    with open(PARAMS_PATH, "w", encoding="utf-8") as f:
-        json.dump(calibrated, f, indent=2)
-    if summary_lines:
-        send_telegram(f"📊 <b>Walk-Forward v4.0 ({mode})</b>\n" + "\n".join(summary_lines))
-    if plot_chart and curves and HAS_MPL:
-        plt.figure(figsize=(10, 5))
-        for name, c in curves.items():
-            plt.plot(c, label=name)
-        plt.title(f"v4.0 Hardened MTF + Partial TP1 + Commission ({mode})")
-        plt.xlabel("Trade #")
-        plt.ylabel("Equity ($)")
-        plt.legend(loc="best")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(CHART_PATH, dpi=110)
-        plt.close()
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["live", "backtest", "both", "check"], default="live")
-    args = parser.parse_args()
-    setup_logging()
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    db_init(conn)
+def run_check_command(conn: sqlite3.Connection, force_notify: bool = False) -> None:
+    """
+    Implements CLI `--mode check` & Telegram `/check` on-demand diagnostics across all 4 instruments.
+    """
+    triggered = force_notify or FORCE_CHECK
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        last_uid = int(get_state(conn, "last_tg_update_id", "0") or "0")
+        try:
+            r = request_with_backoff(
+                "GET",
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"offset": last_uid + 1, "timeout": 2},
+                max_retries=2,
+            )
+            updates = r.json().get("result") or []
+            max_uid = last_uid
+            for up in updates:
+                uid = int(up.get("update_id", 0))
+                max_uid = max(max_uid, uid)
+                msg = up.get("message") or up.get("channel_post") or {}
+                txt = str(msg.get("text", "")).strip().lower()
+                if any(cmd in txt for cmd in ("/check", "/status", "/signal")):
+                    triggered = True
+            if max_uid > last_uid:
+                set_state(conn, "last_tg_update_id", str(max_uid))
+        except Exception as exc:
+            log.warning("Telegram getUpdates warning: %s", exc)
+
+    lines = [f"📡 <b>MULTI-ASSET STATUS REPORT v{BOT_VERSION}</b>", f"🕒 <code>{utc_iso()}</code>", ""]
+    for inst in INSTRUMENTS:
+        is_open, mkt_st = is_market_open(inst)
+        df_15, src_15 = fetch_candles(inst, "15m", deep=False)
+        df_1h, src_1h = fetch_candles(inst, "1h", deep=False)
+        ref_px = float(df_15["close"].iloc[-1]) if (df_15 is not None and not df_15.empty) else 0.0
+        micro = fetch_live_microstructure(inst, ref_px) if ref_px > 0 else {"price": 0.0, "spread": 0.0, "source": "N/A"}
+
+        regime = "N/A"
+        b_sc, s_sc = 0, 0
+        if df_15 is not None and df_1h is not None and len(df_15) >= 80 and len(df_1h) >= 60:
+            c_sc = precompute_signals(inst, "scalp", df_15, df_1h)
+            regime = str(c_sc["regimes"][-1])
+            b_sc = int(c_sc["b_scores"][-1])
+            s_sc = int(c_sc["s_scores"][-1])
+
+        cal_sc = get_calibration(conn, inst, "scalp")
+        cal_sw = get_calibration(conn, inst, "swing")
+        g_sc = f"ON(PF {cal_sc['oos_pf']:.2f})" if (cal_sc and cal_sc["active"]) else "OFF"
+        g_sw = f"ON(PF {cal_sw['oos_pf']:.2f})" if (cal_sw and cal_sw["active"]) else "OFF"
+
+        lines.append(
+            f"• <b>{inst}</b> [{mkt_st}] | Px: <code>{fmt_price(inst, micro['price']) if micro['price'] else 'N/A'}</code> "
+            f"(Spr: <code>{micro['spread']:.2f}</code>)\n"
+            f"  Regime: <code>{regime}</code> | Bull/Bear: <code>{b_sc}/{s_sc}</code> | "
+            f"Gate: <code>S:{g_sc} W:{g_sw}</code>"
+        )
+
+    open_rows = conn.execute("SELECT inst, mode, direction, entry, best_sl, tp1_hit FROM trades WHERE status='OPEN'").fetchall()
+    lines.append("")
+    if open_rows:
+        lines.append(f"📂 <b>Open Positions ({len(open_rows)}):</b>")
+        for r in open_rows:
+            lines.append(f"  - {r['inst']} {r['mode'].upper()} {r['direction']} @ <code>{fmt_price(r['inst'], r['entry'])}</code> (SL <code>{fmt_price(r['inst'], r['best_sl'])}</code>, TP1={'✓' if r['tp1_hit'] else '✗'})")
+    else:
+        lines.append("📂 Open Positions: <code>0</code>")
+
+    report = "\n".join(lines)
+    log.info("\n%s", re.sub(r"<[^>]+>", "", report))
+    if triggered:
+        notify_all(report)
+
+
+# ==============================================================================
+# 11. MAIN ORCHESTRATOR & CLI ENTRYPOINT
+# ==============================================================================
+def calibration_needs_refresh(conn: sqlite3.Connection) -> bool:
+    if FORCE_BACKTEST:
+        return True
+    last_iso = get_state(conn, "last_bt_utc")
+    if not last_iso:
+        return True
     try:
-        if args.mode in ("live", "both"):
-            if not HAS_DATA_LIBS:
-                raise RuntimeError("Missing numpy/pandas dependencies")
-            run_live(conn)
+        dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+        return (utc_now() - dt).total_seconds() >= GLOBAL["bt_refresh_hours"] * 3600
+    except ValueError:
+        return True
+
+
+def run_live_cycle(conn: sqlite3.Connection) -> None:
+    if calibration_needs_refresh(conn):
+        log.info("Calibration cache expired or missing -> running walk-forward calibration...")
+        run_calibration(conn)
+
+    monitor_open_trades(conn)
+
+    for inst in INSTRUMENTS:
+        for mode in ("scalp", "swing"):
+            try:
+                res = evaluate_live_instrument(conn, inst, mode)
+                st = res["status"]
+                if st == "SIGNAL":
+                    log.info("[SIGNAL] %s %s %s score=%d @ %s", inst, mode, res["direction"], res["score"], res["entry"])
+                    save_and_broadcast_signal(conn, res)
+                elif st == "NO_SIGNAL":
+                    log.info("[NO_SIGNAL] %s %s | %s (Bull=%s Bear=%s Reg=%s)", inst, mode, res["reason"], res.get("bull"), res.get("bear"), res.get("regime"))
+                else:
+                    log.info("[SKIP] %s %s | %s", inst, mode, res["reason"])
+            except Exception as exc:
+                log.error("[ERROR] %s %s cycle failed: %s", inst, mode, exc)
+                notify_error_throttled(conn, f"{inst} {mode}", exc)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=f"Zero-API-Key Multi-Asset Quant Signal Bot v{BOT_VERSION}")
+    parser.add_argument("--mode", choices=["live", "backtest", "both", "check"], default="both")
+    parser.add_argument("--force-check", action="store_true", help="Force sending /check diagnostic report")
+    args = parser.parse_args()
+
+    conn = init_db(DB_PATH)
+    try:
+        log.info("Starting Multi-Asset Quant Bot v%s | cli_mode=%s", BOT_VERSION, args.mode)
         if args.mode in ("backtest", "both"):
-            if not HAS_DATA_LIBS:
-                raise RuntimeError("Missing numpy/pandas dependencies")
-            run_calibration("SWING", plot_chart=True)
-            run_calibration("SCALPING", plot_chart=False)
-    except Exception as e:
-        logging.error(f"[fatal] {e}\n{traceback.format_exc()}")
-        send_telegram(f"⚠️ <b>Bot v4 Error</b>\n<code>{_esc(str(e)[:300])}</code>")
-        sys.exit(1)
+            chart_items: List[Dict[str, Any]] = []
+            res = run_calibration(conn, chart_collector=chart_items)
+            chart = generate_multiasset_chart(chart_items, CHART_PATH)
+            active_cnt = sum(1 for v in res.values() if v.get("active"))
+            summary = f"📊 <b>CALIBRATION COMPLETE v{BOT_VERSION}</b>\n✅ Active Modes: <code>{active_cnt}/{len(res)}</code>"
+            if chart:
+                tg_send_photo(chart, summary)
+            elif args.mode == "backtest":
+                notify_all(summary)
+
+        if args.mode in ("live", "both"):
+            run_live_cycle(conn)
+
+        if args.mode == "check":
+            run_check_command(conn, force_notify=args.force_check)
+        elif args.mode in ("live", "both") and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            run_check_command(conn, force_notify=False)
+
+        return 0
+    except Exception as exc:
+        log.critical("Fatal error in main: %s\n%s", exc, traceback.format_exc())
+        notify_error_throttled(conn, "main", exc)
+        return 1
     finally:
         conn.close()
 
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
