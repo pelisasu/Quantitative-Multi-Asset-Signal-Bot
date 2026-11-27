@@ -1,0 +1,119 @@
+name: Quant Multi-Asset Signal Bot v4.2
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode eksekusi bot"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - live
+          - backtest
+          - both
+          - check
+      force_backtest:
+        description: "Paksa kalibrasi ulang Walk-Forward OOS"
+        required: false
+        default: false
+        type: boolean
+      force_check:
+        description: "Paksa kirim laporan status (/check) ke Telegram/Discord"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: quant-bot-v4-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-quant-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      TZ: UTC
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+      ACCOUNT_BALANCE: ${{ vars.ACCOUNT_BALANCE || '1000.0' }}
+      RISK_PCT_SCALPING: ${{ vars.RISK_PCT_SCALPING || '1.0' }}
+      RISK_PCT_SWING: ${{ vars.RISK_PCT_SWING || '1.5' }}
+      MAX_OPEN_TRADES: ${{ vars.MAX_OPEN_TRADES || '4' }}
+      MAX_BUCKET_RISK_PCT: ${{ vars.MAX_BUCKET_RISK_PCT || '2.0' }}
+      SQLITE_DB_PATH: signals_v4.db
+      BACKTEST_CHART_PATH: backtest_performance.png
+      LOCAL_DATA_DIR: data
+      FORENSIC_AUDIT_LOG: forensic_audit_v4.log
+      FORCE_BACKTEST: ${{ inputs.force_backtest || 'false' }}
+      FORCE_CHECK: ${{ inputs.force_check || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas matplotlib requests websocket-client websockets yfinance
+
+      - name: Restore SQLite state & OHLCV cache
+        id: cache-state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            signals_v4.db
+            signals_v4.db-wal
+            signals_v4.db-shm
+            data/
+          key: bot-v4-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bot-v4-state-
+
+      - name: Run Multi-Asset Quant Bot v4.2
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            EXTRA_ARGS=""
+            if [ "${{ inputs.force_check }}" = "true" ]; then
+              EXTRA_ARGS="--force-check"
+            fi
+            python bot_v4.py --mode "${{ inputs.mode || 'both' }}" $EXTRA_ARGS
+          else
+            python bot_v4.py --mode live
+          fi
+
+      - name: Save SQLite state & OHLCV cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            signals_v4.db
+            signals_v4.db-wal
+            signals_v4.db-shm
+            data/
+          key: bot-v4-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload audit logs & backtest chart
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quant-bot-v4-artifacts-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            backtest_performance.png
+            forensic_audit_v4.log
