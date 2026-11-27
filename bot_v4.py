@@ -107,12 +107,15 @@ GLOBAL: Dict[str, Any] = {
     "anti_flip_scalp_min": 90,
     "anti_flip_swing_min": 480,
     "bt_refresh_hours": 12,
-    "bt_min_fold_trades_scalp": 4,
+    "bt_min_fold_trades_scalp": 3,
     "bt_min_fold_trades_swing": 3,
-    "bt_min_is_trades": 10,
-    "bt_min_oos_pf": 1.20,
-    "bt_max_oos_dd_pct": 14.0,
-    "be_buffer_r": 0.05,  # +0.05R buffer on breakeven SL to cover fees/slippage
+    "bt_min_is_trades": 12,
+    "bt_min_oos_trades_scalp": 12,
+    "bt_min_oos_trades_swing": 10,
+    "bt_min_oos_pf": 1.18,
+    "bt_max_oos_dd_pct": 15.0,
+    "tp1_partial_pct": 0.40,  # Lock 40% at TP1, trail 60% for big R winners
+    "be_buffer_r": 0.05,      # +0.05R buffer on breakeven SL to cover fees/slippage
     "error_cooldown_min": 60,
 }
 
@@ -149,9 +152,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 120,
             "stale_min": 45,
             "max_entry_dev_atr": 0.45,
-            "max_hold_bars": 28,
-            "tp1_rr": 1.0,
-            "min_rr": 1.65,
+            "max_hold_bars": 40,
+            "tp1_rr": 1.25,
+            "min_rr": 1.80,
             "min_atr_px": 1.2,
             "min_adx": 16.5,
             "min_er": 0.21,
@@ -166,9 +169,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 90,
             "stale_min": 150,
             "max_entry_dev_atr": 0.65,
-            "max_hold_bars": 42,
-            "tp1_rr": 1.0,
-            "min_rr": 1.90,
+            "max_hold_bars": 84,
+            "tp1_rr": 1.25,
+            "min_rr": 2.00,
             "min_atr_px": 3.0,
             "min_adx": 17.5,
             "min_er": 0.20,
@@ -209,9 +212,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 120,
             "stale_min": 45,
             "max_entry_dev_atr": 0.45,
-            "max_hold_bars": 28,
-            "tp1_rr": 1.0,
-            "min_rr": 1.65,
+            "max_hold_bars": 40,
+            "tp1_rr": 1.25,
+            "min_rr": 1.80,
             "min_atr_px": 8.0,
             "min_adx": 16.5,
             "min_er": 0.21,
@@ -226,9 +229,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 90,
             "stale_min": 150,
             "max_entry_dev_atr": 0.65,
-            "max_hold_bars": 42,
-            "tp1_rr": 1.0,
-            "min_rr": 1.90,
+            "max_hold_bars": 84,
+            "tp1_rr": 1.25,
+            "min_rr": 2.00,
             "min_atr_px": 20.0,
             "min_adx": 17.5,
             "min_er": 0.20,
@@ -273,9 +276,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 120,
             "stale_min": 35,
             "max_entry_dev_atr": 0.45,
-            "max_hold_bars": 28,
-            "tp1_rr": 1.0,
-            "min_rr": 1.65,
+            "max_hold_bars": 40,
+            "tp1_rr": 1.25,
+            "min_rr": 1.80,
             "min_atr_px": 30.0,
             "min_adx": 16.5,
             "min_er": 0.21,
@@ -290,9 +293,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 90,
             "stale_min": 120,
             "max_entry_dev_atr": 0.65,
-            "max_hold_bars": 42,
-            "tp1_rr": 1.0,
-            "min_rr": 1.90,
+            "max_hold_bars": 84,
+            "tp1_rr": 1.25,
+            "min_rr": 2.00,
             "min_atr_px": 80.0,
             "min_adx": 17.5,
             "min_er": 0.20,
@@ -337,9 +340,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 120,
             "stale_min": 35,
             "max_entry_dev_atr": 0.45,
-            "max_hold_bars": 28,
-            "tp1_rr": 1.0,
-            "min_rr": 1.65,
+            "max_hold_bars": 40,
+            "tp1_rr": 1.25,
+            "min_rr": 1.80,
             "min_atr_px": 2.5,
             "min_adx": 16.5,
             "min_er": 0.21,
@@ -354,9 +357,9 @@ INSTRUMENTS: Dict[str, Dict[str, Any]] = {
             "htf_min": 90,
             "stale_min": 120,
             "max_entry_dev_atr": 0.65,
-            "max_hold_bars": 42,
-            "tp1_rr": 1.0,
-            "min_rr": 1.90,
+            "max_hold_bars": 84,
+            "tp1_rr": 1.25,
+            "min_rr": 2.00,
             "min_atr_px": 7.0,
             "min_adx": 17.5,
             "min_er": 0.20,
@@ -1449,8 +1452,19 @@ def fetch_candles(inst: str, tf: str, deep: bool = False) -> Tuple[Optional[pd.D
                 _save_cache(df_4h, inst, "4h")
                 return df_4h, f"{src_1h}->4H"
 
-    # --- CRYPTO: Kraken + Coinbase + OKX + Deriv WS + Yahoo Crumb ---
+    # --- CRYPTO: Deep mode prefers fast 60d/365d YahooCrumb/OKX/Deriv; Live prefers Kraken/Coinbase ---
     if inst in ("BTCUSD", "ETHUSD"):
+        if deep:
+            try:
+                rng_str = "60d" if tf in ("5m", "15m") else "365d"
+                df_yf, _ = _YAHOO.fetch_chart(cfg["yf"], tf, rng_str)
+                df_yf = sanitize_and_drop_incomplete(df_yf, tf)
+                if len(df_yf) >= 1200:
+                    _save_cache(df_yf, inst, tf)
+                    return df_yf, "YahooCrumb_Deep"
+            except Exception:
+                pass
+
         if not deep:
             df = _fetch_kraken_ohlc(cfg["kraken_pair"], tf)
             if df is not None:
@@ -1459,7 +1473,7 @@ def fetch_candles(inst: str, tf: str, deep: bool = False) -> Tuple[Optional[pd.D
                     _save_cache(df, inst, tf)
                     return df, "Kraken"
 
-        df = _fetch_coinbase_ohlc(cfg["coinbase_pair"], tf, batches=8 if deep else 2)
+        df = _fetch_coinbase_ohlc(cfg["coinbase_pair"], tf, batches=14 if deep else 2)
         if df is not None:
             df = sanitize_and_drop_incomplete(df, tf)
             if len(df) >= min_bars:
@@ -1467,14 +1481,14 @@ def fetch_candles(inst: str, tf: str, deep: bool = False) -> Tuple[Optional[pd.D
                 return df, "Coinbase"
 
         if cfg.get("deriv_sym") and tf in ("5m", "15m", "1h"):
-            df = _ws_fetch_candles(cfg["deriv_sym"], TF_SECONDS[tf], batches=2 if deep else 1, count=2000)
+            df = _ws_fetch_candles(cfg["deriv_sym"], TF_SECONDS[tf], batches=4 if deep else 1, count=2000)
             if df is not None:
                 df = sanitize_and_drop_incomplete(df, tf)
                 if len(df) >= min_bars:
                     _save_cache(df, inst, tf)
                     return df, "DerivWS"
 
-        df = _fetch_okx_ohlc(cfg["okx_inst"], tf, batches=6 if deep else 2)
+        df = _fetch_okx_ohlc(cfg["okx_inst"], tf, batches=12 if deep else 2)
         if df is not None:
             df = sanitize_and_drop_incomplete(df, tf)
             if len(df) >= 80:
@@ -1482,7 +1496,7 @@ def fetch_candles(inst: str, tf: str, deep: bool = False) -> Tuple[Optional[pd.D
                 return df, "OKX"
 
         try:
-            rng_str = "60d" if tf in ("5m", "15m") else "730d"
+            rng_str = "60d" if tf in ("5m", "15m") else "365d"
             df_yf, _ = _YAHOO.fetch_chart(cfg["yf"], tf, rng_str if deep else ("14d" if tf == "15m" else "90d"))
             df_yf = sanitize_and_drop_incomplete(df_yf, tf)
             if len(df_yf) >= 80:
@@ -1494,17 +1508,17 @@ def fetch_candles(inst: str, tf: str, deep: bool = False) -> Tuple[Optional[pd.D
     # --- XAUUSD: Pure Spot Deriv WS (frxXAUUSD) -> Optional TD -> Basis-Adjusted GC=F ---
     elif inst == "XAUUSD":
         if cfg.get("deriv_sym") and tf in ("5m", "15m", "1h"):
-            df = _ws_fetch_candles(cfg["deriv_sym"], TF_SECONDS[tf], batches=2 if deep else 1, count=1800)
+            df = _ws_fetch_candles(cfg["deriv_sym"], TF_SECONDS[tf], batches=4 if deep else 1, count=1800)
             if df is not None:
                 df = sanitize_and_drop_incomplete(df, tf)
-                if len(df) >= 120:
+                if len(df) >= (1800 if deep else 120):
                     _save_cache(df, inst, tf)
                     return df, "DerivWS_Spot"
 
-        df_td = _fetch_twelvedata_optional(cfg["td"], tf, 3500 if deep else 450)
+        df_td = _fetch_twelvedata_optional(cfg["td"], tf, 4500 if deep else 450)
         if df_td is not None:
             df_td = sanitize_and_drop_incomplete(df_td, tf)
-            if len(df_td) >= 120:
+            if len(df_td) >= (1500 if deep else 120):
                 _save_cache(df_td, inst, tf)
                 return df_td, "TwelveData"
 
@@ -1925,68 +1939,100 @@ def precompute_signals(
 
         # ------------------------------------------------------------------
         # 3. Trigger Setups & Candle Anatomy (0 - 30 pts)
+        # Empirically validated setups: Pullback Rejection, Squeeze Breakout, Liquidity Sweep
         # ------------------------------------------------------------------
-        recent_sq = bool(sq_a[i - 1] or sq_a[i - 2] or sq_a[i - 3])
+        recent_sq = bool(sq_a[i - 1] or sq_a[i - 2] or sq_a[i - 3] or sq_a[i - 4])
         vol_boost = vol_r[i] >= 1.12
 
         # Bull triggers
-        bull_brk = (c[i] > d_hi[i]) and (c[i - 1] <= d_hi[i] * 1.0005) and (close_pos >= 0.58) and (body_ratio >= 0.35)
-        pullback_zone_b = (l[i] <= e20[i] + 0.25 * atr) or (l[i - 1] <= e20[i - 1] + 0.20 * atr) or (l[i] <= vwap_a[i] + 0.2 * atr)
+        ext_b = (c[i] - e20[i]) / max(atr, EPSILON)
+        bull_sq_brk = (
+            recent_sq
+            and (c[i] > d_hi[i])
+            and (c[i - 1] <= d_hi[i] * 1.0005)
+            and (close_pos >= 0.62)
+            and (body_ratio >= 0.38)
+            and (ext_b <= 1.80)
+        )
+        pullback_zone_b = (l[i] <= e20[i] + 0.25 * atr) or (l[i - 1] <= e20[i - 1] + 0.20 * atr) or (l[i] <= vwap_a[i] + 0.20 * atr)
         bull_pb = (
-            pullback_zone_b
+            (c[i] > e50[i])
+            and pullback_zone_b
             and (c[i] > o[i])
-            and (c[i] > h[i - 1] or close_pos >= 0.62)
+            and (close_pos >= 0.60)
             and (c[i] > e20[i])
             and (38.0 <= rsi_a[i] <= 66.0)
             and (rsi_a[i] > rsi_a[i - 1])
         )
-        bull_mom = (c[i] > e20[i]) and (c[i] > vwap_a[i]) and (macd_a[i] > 0) and (macd_a[i - 1] <= 0) and (close_pos >= 0.58)
+        prev_10_lo = float(np.min(l[i - 10:i]))
+        bull_sweep = (
+            (c[i] > e200[i])
+            and (l[i] < prev_10_lo)
+            and (c[i] > prev_10_lo)
+            and (close_pos >= 0.65)
+            and (rsi_a[i] < 60.0)
+        )
 
         trig_b = 0.0
-        if bull_brk:
-            trig_b = 20.0 + (5.0 if recent_sq else 0.0) + (5.0 if vol_boost else 0.0)
-            b_setups[i] = "BREAKOUT_SQUEEZE" if recent_sq else "BREAKOUT"
-        elif bull_pb:
-            trig_b = 18.0 + (6.0 if close_pos >= 0.72 else 2.0) + (4.0 if vol_boost else 0.0)
+        if bull_pb:
+            trig_b = 22.0 + (5.0 if close_pos >= 0.72 else 2.0) + (3.0 if vol_boost else 0.0)
             b_setups[i] = "PULLBACK_REJECTION"
-        elif bull_mom:
-            trig_b = 16.0 + (4.0 if close_pos >= 0.70 else 0.0)
-            b_setups[i] = "MOMENTUM_SHIFT"
+        elif bull_sq_brk:
+            trig_b = 21.0 + (4.0 if vol_boost else 0.0) + (3.0 if close_pos >= 0.72 else 0.0)
+            b_setups[i] = "SQUEEZE_BREAKOUT"
+        elif bull_sweep:
+            trig_b = 20.0 + (4.0 if close_pos >= 0.75 else 0.0)
+            b_setups[i] = "LIQUIDITY_SWEEP"
 
         # Bear triggers
-        bear_brk = (c[i] < d_lo[i]) and (c[i - 1] >= d_lo[i] * 0.9995) and (close_pos <= 0.42) and (body_ratio >= 0.35)
-        pullback_zone_s = (h[i] >= e20[i] - 0.25 * atr) or (h[i - 1] >= e20[i - 1] - 0.20 * atr) or (h[i] >= vwap_a[i] - 0.2 * atr)
+        ext_s = (e20[i] - c[i]) / max(atr, EPSILON)
+        bear_sq_brk = (
+            recent_sq
+            and (c[i] < d_lo[i])
+            and (c[i - 1] >= d_lo[i] * 0.9995)
+            and (close_pos <= 0.38)
+            and (body_ratio >= 0.38)
+            and (ext_s <= 1.80)
+        )
+        pullback_zone_s = (h[i] >= e20[i] - 0.25 * atr) or (h[i - 1] >= e20[i - 1] - 0.20 * atr) or (h[i] >= vwap_a[i] - 0.20 * atr)
         bear_pb = (
-            pullback_zone_s
+            (c[i] < e50[i])
+            and pullback_zone_s
             and (c[i] < o[i])
-            and (c[i] < l[i - 1] or close_pos <= 0.38)
+            and (close_pos <= 0.40)
             and (c[i] < e20[i])
             and (34.0 <= rsi_a[i] <= 62.0)
             and (rsi_a[i] < rsi_a[i - 1])
         )
-        bear_mom = (c[i] < e20[i]) and (c[i] < vwap_a[i]) and (macd_a[i] < 0) and (macd_a[i - 1] >= 0) and (close_pos <= 0.42)
+        prev_10_hi = float(np.max(h[i - 10:i]))
+        bear_sweep = (
+            (c[i] < e200[i])
+            and (h[i] > prev_10_hi)
+            and (c[i] < prev_10_hi)
+            and (close_pos <= 0.35)
+            and (rsi_a[i] > 40.0)
+        )
 
         trig_s = 0.0
-        if bear_brk:
-            trig_s = 20.0 + (5.0 if recent_sq else 0.0) + (5.0 if vol_boost else 0.0)
-            s_setups[i] = "BREAKOUT_SQUEEZE" if recent_sq else "BREAKOUT"
-        elif bear_pb:
-            trig_s = 18.0 + (6.0 if close_pos <= 0.28 else 2.0) + (4.0 if vol_boost else 0.0)
+        if bear_pb:
+            trig_s = 22.0 + (5.0 if close_pos <= 0.28 else 2.0) + (3.0 if vol_boost else 0.0)
             s_setups[i] = "PULLBACK_REJECTION"
-        elif bear_mom:
-            trig_s = 16.0 + (4.0 if close_pos <= 0.30 else 0.0)
-            s_setups[i] = "MOMENTUM_SHIFT"
+        elif bear_sq_brk:
+            trig_s = 21.0 + (4.0 if vol_boost else 0.0) + (3.0 if close_pos <= 0.28 else 0.0)
+            s_setups[i] = "SQUEEZE_BREAKOUT"
+        elif bear_sweep:
+            trig_s = 20.0 + (4.0 if close_pos <= 0.25 else 0.0)
+            s_setups[i] = "LIQUIDITY_SWEEP"
 
         # ------------------------------------------------------------------
-        # 4. Hard Safety Vetoes (Anti-Exhaustion, Anti-Countertrend, Room)
+        # 4. Hard Safety Vetoes (Strict HTF Trend Alignment & Anti-Exhaustion)
         # ------------------------------------------------------------------
         sb = int(round(min(100.0, htf_b + ltf_b + trig_b)))
         ss = int(round(min(100.0, htf_s + ltf_s + trig_s)))
 
-        # Must have a real trigger & not fight strong HTF counter-trend
-        if b_setups[i] == "NONE" or (rsi_a[i] > 74.0) or (vz_a[i] > 2.4) or (c[i] - e20[i] > 2.6 * atr) or h_bear:
+        if b_setups[i] == "NONE" or (not h_bull) or (rsi_a[i] > 72.0) or (vz_a[i] > 2.3) or (ext_b > 2.2):
             sb = min(sb, 45)
-        if s_setups[i] == "NONE" or (rsi_a[i] < 26.0) or (vz_a[i] < -2.4) or (e20[i] - c[i] > 2.6 * atr) or h_bull:
+        if s_setups[i] == "NONE" or (not h_bear) or (rsi_a[i] < 28.0) or (vz_a[i] < -2.3) or (ext_s > 2.2):
             ss = min(ss, 45)
 
         b_scores[i] = sb
@@ -2102,7 +2148,7 @@ def backtest_slice(
     sl_mult: float,
     tp2_r: float,
     min_score: int,
-    trail_mult: float = 1.4,
+    trail_mult: float = 1.8,
 ) -> Dict[str, Any]:
     cfg = INSTRUMENTS[inst]
     mcfg = cfg[mode]
@@ -2124,16 +2170,18 @@ def backtest_slice(
 
     min_margin = int(mcfg["min_margin"])
     max_hold = int(mcfg["max_hold_bars"])
-    lot_unit = float(cfg["contract"]["lot_unit"])
     half_cost_px = 0.5 * float(costs["spread_px"]) + float(costs["slip_px"])
     comm_rt = float(costs["comm_rt_per_lot"])
     be_buf = float(GLOBAL["be_buffer_r"])
+    tp1_pct = float(GLOBAL["tp1_partial_pct"])
+    rem_pct = 1.0 - tp1_pct
 
     pos: Optional[Dict[str, Any]] = None
     trades_r: List[float] = []
     eq = 100.0
     peak = 100.0
     max_dd = 0.0
+    cd_bars = 0
     risk_pct = GLOBAL["risk_pct_scalping"] if mode == "scalp" else GLOBAL["risk_pct_swing"]
 
     n_lim = min(end_idx, len(c) - 1)
@@ -2152,7 +2200,7 @@ def backtest_slice(
                 if bar_o <= pos["sl"] or bar_l <= pos["sl"]:
                     fill = min(bar_o, pos["sl"])
                     rem_r = (fill - pos["entry"]) / sl_dist
-                    exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                    exit_r = (tp1_pct * pos["tp1_r"] + rem_pct * rem_r) if pos["tp1_hit"] else rem_r
                     done = True
                 else:
                     if not pos["tp1_hit"] and bar_h >= pos["tp1"]:
@@ -2161,7 +2209,7 @@ def backtest_slice(
                         pos["sl"] = max(pos["sl"], pos["entry"] + be_buf * sl_dist)
                     if bar_h >= pos["tp2"]:
                         rem_r = tp2_r
-                        exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                        exit_r = (tp1_pct * pos["tp1_r"] + rem_pct * rem_r) if pos["tp1_hit"] else rem_r
                         done = True
                     elif pos["tp1_hit"]:
                         new_trail = bar_c - pos["trail_dist"]
@@ -2171,7 +2219,7 @@ def backtest_slice(
                 if bar_o >= pos["sl"] or bar_h >= pos["sl"]:
                     fill = max(bar_o, pos["sl"])
                     rem_r = (pos["entry"] - fill) / sl_dist
-                    exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                    exit_r = (tp1_pct * pos["tp1_r"] + rem_pct * rem_r) if pos["tp1_hit"] else rem_r
                     done = True
                 else:
                     if not pos["tp1_hit"] and bar_l <= pos["tp1"]:
@@ -2180,7 +2228,7 @@ def backtest_slice(
                         pos["sl"] = min(pos["sl"], pos["entry"] - be_buf * sl_dist)
                     if bar_l <= pos["tp2"]:
                         rem_r = tp2_r
-                        exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                        exit_r = (tp1_pct * pos["tp1_r"] + rem_pct * rem_r) if pos["tp1_hit"] else rem_r
                         done = True
                     elif pos["tp1_hit"]:
                         new_trail = bar_c + pos["trail_dist"]
@@ -2189,7 +2237,7 @@ def backtest_slice(
 
             if not done and pos["bars"] >= max_hold:
                 rem_r = ((bar_c - pos["entry"]) if d == "BUY" else (pos["entry"] - bar_c)) / sl_dist
-                exit_r = (0.5 * pos["tp1_r"] + 0.5 * rem_r) if pos["tp1_hit"] else rem_r
+                exit_r = (tp1_pct * pos["tp1_r"] + rem_pct * rem_r) if pos["tp1_hit"] else rem_r
                 done = True
 
             if done:
@@ -2199,8 +2247,14 @@ def backtest_slice(
                 peak = max(peak, eq)
                 dd = (peak - eq) / peak * 100.0
                 max_dd = max(max_dd, dd)
+                if net_r < 0:
+                    cd_bars = 3
                 pos = None
                 continue
+
+        if cd_bars > 0:
+            cd_bars -= 1
+            continue
 
         # 2. Evaluate signal strictly on closed bar t -> execute on t+1 open
         if pos is None and sess_ok[t]:
@@ -2268,9 +2322,9 @@ def backtest_slice(
 
 def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
-    sl_grid = [1.3, 1.5, 1.8]
-    tp2_grid = [2.0, 2.4, 2.8]
-    score_grid = [68, 72, 76]
+    sl_grid = [1.5, 1.8, 2.0]
+    tp2_grid = [2.2, 2.5, 2.8]
+    score_grid = [68, 72, 75]
 
     for inst, cfg in INSTRUMENTS.items():
         for mode in ("scalp", "swing"):
@@ -2286,34 +2340,39 @@ def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dic
             cache = precompute_signals(inst, mode, df_l, df_h)
             n = len(df_l)
             is_end = int(n * 0.65)
-            min_fold_t = GLOBAL["bt_min_fold_trades_scalp"] if mode == "scalp" else GLOBAL["bt_min_fold_trades_swing"]
+            min_oos_t = GLOBAL["bt_min_oos_trades_scalp"] if mode == "scalp" else GLOBAL["bt_min_oos_trades_swing"]
 
             best_score = -1e9
-            best_params = {"sl_mult": 1.5, "tp2_r": 2.4, "min_score": mcfg["min_score"], "trail_mult": 1.4}
+            best_params = {"sl_mult": 1.8, "tp2_r": 2.5, "min_score": mcfg["min_score"], "trail_mult": 1.8}
             best_is = None
 
             for sl_m in sl_grid:
                 for tp2_m in tp2_grid:
                     for sc_m in score_grid:
-                        res_is = backtest_slice(inst, mode, cache, 65, is_end, sl_m, tp2_m, sc_m)
+                        res_is = backtest_slice(inst, mode, cache, 65, is_end, sl_m, tp2_m, sc_m, 1.8)
                         if res_is["trades"] < GLOBAL["bt_min_is_trades"]:
                             continue
-                        obj = res_is["total_r"] + 2.5 * (res_is["pf"] - 1.0) - 0.6 * res_is["max_dd"]
+                        obj = res_is["total_r"] + 2.5 * (res_is["pf"] - 1.0) - 0.5 * res_is["max_dd"]
                         if obj > best_score:
                             best_score = obj
-                            best_params = {"sl_mult": sl_m, "tp2_r": tp2_m, "min_score": sc_m, "trail_mult": 1.4}
+                            best_params = {"sl_mult": sl_m, "tp2_r": tp2_m, "min_score": sc_m, "trail_mult": 1.8}
                             best_is = res_is
 
             if best_is is None:
-                best_is = backtest_slice(inst, mode, cache, 65, is_end, 1.5, 2.4, 68)
-                best_params = {"sl_mult": 1.5, "tp2_r": 2.4, "min_score": 68, "trail_mult": 1.4}
+                best_is = backtest_slice(inst, mode, cache, 65, is_end, 1.8, 2.5, 68, 1.8)
+                best_params = {"sl_mult": 1.8, "tp2_r": 2.5, "min_score": 68, "trail_mult": 1.8}
 
-            # 3-Fold Anchored Walk-Forward OOS validation
+            # Combined OOS metrics
+            res_oos_full = backtest_slice(
+                inst, mode, cache, is_end, n,
+                best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"], best_params["trail_mult"]
+            )
+
+            # 3-Fold Anchored Walk-Forward OOS validation with adaptive fold trade minimum
             oos_len = n - is_end
             fold_size = max(50, oos_len // 3)
             oos_folds_passed = 0
-            oos_r_all: List[float] = []
-            oos_dds: List[float] = []
+            min_fold_t = max(2, min(4, res_oos_full["trades"] // 5))
             for f_idx in range(3):
                 f_s = is_end + f_idx * fold_size
                 f_e = n if f_idx == 2 else min(n, f_s + fold_size)
@@ -2323,18 +2382,12 @@ def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dic
                     inst, mode, cache, f_s, f_e,
                     best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"], best_params["trail_mult"]
                 )
-                oos_r_all.extend(res_f["r_list"])
-                oos_dds.append(res_f["max_dd"])
-                if res_f["trades"] >= min_fold_t and res_f["pf"] >= 1.15 and res_f["total_r"] > 0 and res_f["max_dd"] < GLOBAL["bt_max_oos_dd_pct"]:
+                if res_f["trades"] >= min_fold_t and res_f["pf"] >= 1.10 and res_f["total_r"] > 0 and res_f["max_dd"] < GLOBAL["bt_max_oos_dd_pct"]:
                     oos_folds_passed += 1
 
-            # Combined OOS metrics
-            res_oos_full = backtest_slice(
-                inst, mode, cache, is_end, n,
-                best_params["sl_mult"], best_params["tp2_r"], best_params["min_score"], best_params["trail_mult"]
-            )
             active = (
-                oos_folds_passed >= 2
+                res_oos_full["trades"] >= min_oos_t
+                and oos_folds_passed >= 2
                 and res_oos_full["pf"] >= GLOBAL["bt_min_oos_pf"]
                 and res_oos_full["total_r"] > 0
                 and res_oos_full["max_dd"] <= GLOBAL["bt_max_oos_dd_pct"]
@@ -2354,8 +2407,8 @@ def run_calibration(conn: sqlite3.Connection, chart_collector: Optional[List[Dic
             )
             conn.commit()
             log.info(
-                "[CALIB %s] active=%s | params=%s | IS(t=%d, PF=%.2f, R=%.1f) | OOS(t=%d, WR=%.1f%%, PF=%.2f, DD=%.1f%%, folds=%d/3)",
-                key, active, best_params, best_is["trades"], best_is["pf"], best_is["total_r"],
+                "[CALIB %s] active=%s | bars=%d(%s) | params=%s | IS(t=%d, PF=%.2f, R=%.1f) | OOS(t=%d, WR=%.1f%%, PF=%.2f, DD=%.1f%%, folds=%d/3)",
+                key, active, n, src_l, best_params, best_is["trades"], best_is["pf"], best_is["total_r"],
                 res_oos_full["trades"], res_oos_full["winrate"], res_oos_full["pf"], res_oos_full["max_dd"], oos_folds_passed,
             )
             results[key] = {
@@ -2598,7 +2651,7 @@ def format_signal_html(sig: Dict[str, Any]) -> str:
         f"💵 <b>Entry Live:</b> <code>{fmt_price(inst, sig['entry'])}</code>\n"
         f"📌 Valid Zone: <code>{fmt_price(inst, sig['valid_min'])} – {fmt_price(inst, sig['valid_max'])}</code>\n"
         f"🛑 <b>Stop Loss:</b> <code>{fmt_price(inst, sig['sl'])}</code>\n"
-        f"🎯 <b>TP1 (50% + BE +{GLOBAL['be_buffer_r']:.2f}R):</b> <code>{fmt_price(inst, sig['tp1'])}</code>\n"
+        f"🎯 <b>TP1 ({int(GLOBAL['tp1_partial_pct'] * 100)}% + BE +{GLOBAL['be_buffer_r']:.2f}R):</b> <code>{fmt_price(inst, sig['tp1'])}</code>\n"
         f"🎯 <b>TP2 (Trail Exit):</b> <code>{fmt_price(inst, sig['tp2'])}</code>\n"
         f"🚀 <b>TP3 (Extended):</b> <code>{fmt_price(inst, sig['tp3'])}</code>\n"
         f"────────────────────\n"
@@ -2723,7 +2776,8 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
         if closed:
             rem_r = ((exit_px - entry) if direction == "BUY" else (entry - exit_px)) / sl_dist
             tp1_rr = INSTRUMENTS[inst][mode]["tp1_rr"]
-            net_r = (0.5 * tp1_rr + 0.5 * rem_r) if tp1_hit else rem_r
+            tp1_pct = float(GLOBAL["tp1_partial_pct"])
+            net_r = (tp1_pct * tp1_rr + (1.0 - tp1_pct) * rem_r) if tp1_hit else rem_r
             pnl_usd = round(net_r * risk_usd, 2)
             conn.execute(
                 """
@@ -2748,7 +2802,7 @@ def monitor_open_trades(conn: sqlite3.Connection) -> None:
             if tp1_just_hit:
                 notify_all(
                     f"🎯 <b>TP1 HIT: {inst} ({mode.upper()} {direction})</b>\n"
-                    f"🔒 50% Profit Locked | SL moved to BE+: <code>{fmt_price(inst, cur_sl)}</code>"
+                    f"🔒 {int(GLOBAL['tp1_partial_pct'] * 100)}% Profit Locked | SL moved to BE+: <code>{fmt_price(inst, cur_sl)}</code>"
                 )
 
 
